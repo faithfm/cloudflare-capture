@@ -30,6 +30,7 @@
 #
 # Layout it maintains (all committed):
 #   zones.txt                      fleet index: <zone-id> <zone-name>
+#   zones-meta.tsv                 per-zone: name, assigned NS pair, plan, status
 #   workers.txt                    Worker inventory: <script-name> <created-date>
 #   registrar.txt                  Cloudflare-registered domains: <name> <registered> <expires>
 #   terraform/dns-<zone>.tf        DNS records
@@ -284,14 +285,20 @@ gen_multi() {
 sync_zones() {
   local page=1 total resp
   : > zones.txt
+  : > zones-meta.tsv
   while :; do
     resp=$(api "/zones?per_page=50&page=$page")
     jq -r '.result[] | .id + " " + .name' <<<"$resp" >> zones.txt
+    # name<TAB>assigned NS pair<TAB>plan<TAB>status — the delegation baseline and
+    # plan tier that cf-terraforming discards. "?" means the list endpoint didn't
+    # populate the field; fall back to GET /zones/:id for that zone.
+    jq -r '.result[] | [.name, ((.name_servers // []) | join(",")),
+      (.plan.name // "?"), (.status // "?")] | @tsv' <<<"$resp" >> zones-meta.tsv
     total=$(jq -r '.result_info.total_pages' <<<"$resp")
     [ "$page" -ge "$total" ] && break
     page=$((page + 1))
   done
-  echo "zones: $(wc -l < zones.txt | tr -d ' ')"
+  echo "zones: $(wc -l < zones.txt | tr -d ' ') (+ zones-meta.tsv: NS pair, plan, status)"
 }
 
 # Verify the token can actually see the configured account. Guards every sync
