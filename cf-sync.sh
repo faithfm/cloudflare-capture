@@ -7,7 +7,7 @@
 #   scripts/cf-sync.sh all [type]          sync everything (non-interactive; alias: tf)
 #   scripts/cf-sync.sh <zone-name> [type]  sync one zone, e.g. example.com
 #   scripts/cf-sync.sh account [type]      account-level artifacts only
-#   scripts/cf-sync.sh zones               refresh zones.txt only
+#   scripts/cf-sync.sh zones               refresh the zone indexes only
 # type (zone):    dns | rulesets | pagerules | settings     (omitted = all types)
 # type (account): workers | d1 | r2 | kv | queues | registrar
 # With no argument and no terminal (cron/automation), behaves like "all".
@@ -30,7 +30,8 @@
 #
 # Layout it maintains (all committed):
 #   zones.txt                      fleet index: <zone-id> <zone-name>
-#   zones-meta.tsv                 per-zone: name, assigned NS pair, plan, status
+#   zones-meta.tsv                 per-zone metadata: name, plan, status, type,
+#                                  paused, assigned nameservers (tab-separated)
 #   workers.txt                    Worker inventory: <script-name> <created-date>
 #   registrar.txt                  Cloudflare-registered domains: <name> <registered> <expires>
 #   terraform/dns-<zone>.tf        DNS records
@@ -282,23 +283,31 @@ gen_multi() {
   return 0
 }
 
+# Fleet indexes, refreshed together: zones.txt (id + name — drives the sync
+# loop) and zones-meta.tsv (per-zone account-side metadata the HCL artifacts
+# don't include: plan tier, status, type, paused flag, assigned nameservers —
+# the delegation baseline to verify against each domain's registrar). Both are
+# built in temp files and installed only after every page pulls successfully.
 sync_zones() {
-  local page=1 total resp
-  : > zones.txt
-  : > zones-meta.tsv
+  local page=1 total resp ztmp mtmp
+  ztmp=$(mktemp) mtmp=$(mktemp)
   while :; do
     resp=$(api "/zones?per_page=50&page=$page")
-    jq -r '.result[] | .id + " " + .name' <<<"$resp" >> zones.txt
-    # name<TAB>assigned NS pair<TAB>plan<TAB>status — the delegation baseline and
-    # plan tier that cf-terraforming discards. "?" means the list endpoint didn't
-    # populate the field; fall back to GET /zones/:id for that zone.
-    jq -r '.result[] | [.name, ((.name_servers // []) | join(",")),
-      (.plan.name // "?"), (.status // "?")] | @tsv' <<<"$resp" >> zones-meta.tsv
+    if ! jq -e '.success == true and (.result | type) == "array"' <<<"$resp" >/dev/null 2>&1; then
+      rm -f "$ztmp" "$mtmp"
+      echo "unexpected zone-list response (page $page) — kept previous zone indexes" >&2
+      return 1
+    fi
+    jq -r '.result[] | .id + " " + .name' <<<"$resp" >> "$ztmp"
+    jq -r '.result[] | [.name, (.plan.name // "?"), (.status // "?"), (.type // "?"),
+      (.paused | tostring), ((.name_servers // []) | join(","))] | @tsv' <<<"$resp" >> "$mtmp"
     total=$(jq -r '.result_info.total_pages' <<<"$resp")
     [ "$page" -ge "$total" ] && break
     page=$((page + 1))
   done
-  echo "zones: $(wc -l < zones.txt | tr -d ' ') (+ zones-meta.tsv: NS pair, plan, status)"
+  mv "$ztmp" zones.txt
+  mv "$mtmp" zones-meta.tsv
+  echo "zones: $(wc -l < zones.txt | tr -d ' ')"
 }
 
 # Verify the token can actually see the configured account. Guards every sync
