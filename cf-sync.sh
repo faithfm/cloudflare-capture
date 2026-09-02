@@ -8,8 +8,8 @@
 #   scripts/cf-sync.sh <zone-name> [type]  sync one zone, e.g. example.com
 #   scripts/cf-sync.sh account [type]      account-level artifacts only
 #   scripts/cf-sync.sh zones               refresh the zone indexes only
-# type (zone):    dns | rulesets | pagerules | settings     (omitted = all types)
-# type (account): workers | d1 | r2 | kv | queues | registrar
+# type (zone):    dns | rulesets | pagerules | settings | waf   (omitted = all types)
+# type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications
 # With no argument and no terminal (cron/automation), behaves like "all".
 # Dependencies (jq, terraform, cf-terraforming) are checked on start; if missing,
 # the script prints the install commands and offers to run them via Homebrew.
@@ -38,10 +38,20 @@
 #   terraform/settings-<zone>.tf   zone settings (incl. SSL/TLS)
 #   terraform/rulesets-<zone>.tf   rulesets: redirect/transform/WAF/... phases
 #   terraform/pagerules-<zone>.tf  legacy Page Rules
+#   terraform/waf-<zone>.tf        WAF-family zone config held OUTSIDE the rulesets
+#                                  API: Bot Fight Mode / Super Bot Fight Mode,
+#                                  leaked-credential detection (+ its custom
+#                                  detection rules while enabled), IP Access Rules,
+#                                  Zone Lockdowns, User Agent Blocking rules. The
+#                                  WAF rules themselves (custom rules, managed-
+#                                  ruleset deployments and overrides, rate limits,
+#                                  DDoS overrides) are zone rulesets -> rulesets-*.tf
 #   terraform/account-*.tf         account-scoped config: Workers custom domains &
 #                                  cron triggers, D1 databases, R2 buckets & custom
 #                                  domains, KV namespaces, Queues & consumers,
-#                                  Registrar settings (auto-renew/lock/privacy)
+#                                  Registrar settings (auto-renew/lock/privacy),
+#                                  WAF lists + list items + account IP Access Rules,
+#                                  notification policies
 # An empty result (e.g. zone has no page rules) produces no file, and removes a
 # stale one — absence of the file means "zone has none of these".
 # Deliberately NOT captured — wiring, not code/data: Worker script code + bindings
@@ -52,6 +62,12 @@
 # Worker routes and R2 CORS/lifecycle rules are unsupported by
 # cf-terraforming v0.28 — add jq-to-HCL fallbacks if ever used. R2 artifacts
 # report "skipped" until R2 is enabled on the account (dashboard toggle).
+# Notification webhook destinations are not captured either: their URLs are
+# bearer secrets (policies reference them by id only). Legacy rate limits and
+# firewall rules have no API any more (410 Gone / migrated to rulesets).
+# List ITEMS are rendered by this script, not cf-terraforming: their endpoint
+# is cursor-paginated and 0.28.0 only follows page/total_pages (it would emit
+# the first page only, exit 0) and it writes each item's own id into list_id.
 # Account-level Bulk Redirects are NOT captured — verify none exist in this account.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -184,7 +200,7 @@ progress() { # $1 = outfile, $2 = status text
     account-*) label="${base#account-}" ;;   # account-workers-crons -> workers-crons
     *)         label="${base%%-*}" ;;        # dns-example.com -> dns
   esac
-  printf '[%02d/%02d] %-26s %-15s %s\n' "$ZIDX" "$ZTOTAL" "$ZNAME" "$label" "$2"
+  printf '[%02d/%02d] %-26s %-16s %s\n' "$ZIDX" "$ZTOTAL" "$ZNAME" "$label" "$2"
 }
 
 # run_gen <outtmp> <name-spec> <resource-type> [extra args...]
@@ -355,6 +371,94 @@ queue_ids() {
     else error("unexpected queue-list response") end'
 }
 
+# render_list_items <account-id> <list-id> <list-kind>: JSON array of list
+# items on stdin -> cloudflare_list_item HCL on stdout, sorted by item id,
+# named litem_<list-id>_<item-id> so diffs group by list. Only the attributes
+# the provider schema declares settable are written (ip | asn | hostname{} |
+# redirect{} per list kind, plus comment); timestamps are left out. Strings
+# are JSON-quoted (valid HCL) with ${ and %{ escaped so nothing interpolates.
+render_list_items() {
+  jq -r --arg acct "$1" --arg list "$2" --arg kind "$3" '
+    def h: tojson | gsub("\\$\\{"; "$${") | gsub("%\\{"; "%%{");
+    def v: if type == "string" then h elif type == "boolean" or type == "number" then tostring
+           else error("unsupported list-item value") end;
+    def obj($name): "  \($name) = {\n" + (to_entries | sort_by(.key) | map("    \(.key) = \(.value | v)\n") | join("")) + "  }\n";
+    sort_by(.id) | .[]
+    | "resource \"cloudflare_list_item\" \"terraform_managed_resource_litem_\($list)_\(.id // error("item without id"))\" {\n"
+      + "  account_id = \($acct | h)\n  list_id = \($list | h)\n"
+      + (if .comment != null then "  comment = \(.comment | h)\n" else "" end)
+      + (if   $kind == "ip"       then "  ip = \(.ip // error("ip item without ip") | h)\n"
+         elif $kind == "asn"      then "  asn = \(.asn // error("asn item without asn"))\n"
+         elif $kind == "hostname" then (.hostname // error("hostname item without hostname") | obj("hostname"))
+         elif $kind == "redirect" then (.redirect // error("redirect item without redirect") | obj("redirect"))
+         else error("unknown list kind \($kind)") end)
+      + "}\n"'   # jq adds the newline that separates blocks
+}
+
+# Account lists' items (see the header note on why cf-terraforming is not
+# used for this type): every list is walked with per_page=500 until the
+# cursor runs dry, then rendered and canonicalised with terraform fmt.
+# All-or-nothing: any listing, fetch, envelope or render failure keeps the
+# previous file. No lists / no items -> no file, like every other artifact.
+sync_list_items() {
+  local out="terraform/account-waf-list-items.tf" lists tmp items resp cursor id kind
+  if ! lists=$(api "/accounts/$ACCOUNT_ID/rules/lists" | jq -r '
+       if .success == true and (.result | type) == "array"
+          and ((.result_info.total_pages // 1) <= 1)
+       then .result[] | (.id // error("list without id")) + " " + (.kind // error("list without kind"))
+       else error("unexpected list-list response") end' | sort); then
+    gen_failed "$out" "to list account lists"
+    return 0
+  fi
+  tmp=$(mktemp) items=$(mktemp)
+  : > "$tmp"
+  while read -r id kind; do
+    [ -n "$id" ] || continue
+    : > "$items"
+    cursor=""
+    while :; do
+      if ! resp=$(api "/accounts/$ACCOUNT_ID/rules/lists/$id/items?per_page=500${cursor:+&cursor=$cursor}") \
+         || ! jq -e '.success == true and (.result | type) == "array"' <<<"$resp" >/dev/null 2>&1; then
+        gen_failed "$out" "to fetch items of list $id"
+        rm -f "$tmp" "$items"
+        return 0
+      fi
+      jq -c '.result[]' <<<"$resp" >> "$items"
+      cursor=$(jq -r '.result_info.cursors.after // ""' <<<"$resp")
+      [ -n "$cursor" ] || break
+    done
+    if ! jq -s '.' "$items" | render_list_items "$ACCOUNT_ID" "$id" "$kind" >> "$tmp"; then
+      gen_failed "$out" "to render items of list $id"
+      rm -f "$tmp" "$items"
+      return 0
+    fi
+  done <<<"$lists"
+  rm -f "$items"
+  if [ -s "$tmp" ] && ! "$TFBIN" fmt - < "$tmp" > "$tmp.fmt"; then
+    gen_failed "$out" "to format rendered list items"
+    rm -f "$tmp" "$tmp.fmt"
+    return 0
+  fi
+  [ -s "$tmp" ] && mv "$tmp.fmt" "$tmp"
+  commit_out "$out" "$tmp"
+  return 0
+}
+
+# filter_blocks <file> <ids>: keep only the resource blocks whose name ends in
+# _<id> for an id in <ids> (newline-separated); rewrites <file> in place.
+# Empty <ids> keeps nothing.
+filter_blocks() {
+  local re
+  re=$(printf '%s\n' "$2" | awk 'NF' | paste -sd'|' -)   # awk, not grep: an empty set must not fail under set -e
+  awk -v re="$re" '
+    skipblank && /^$/ { skipblank = 0; next }
+    { skipblank = 0 }
+    /^resource "/ { drop = (re == "" || $0 !~ ("_(" re ")\" \\{$")) }
+    !drop { print }
+    drop && /^}$/ { drop = 0; skipblank = 1 }
+  ' "$1" > "$1.f" && mv "$1.f" "$1"
+}
+
 # Registrar lifecycle index: Cloudflare-registered domains with registration
 # and expiry dates. The managed settings (auto-renew/lock/privacy) live in
 # terraform/account-registrar.tf; WHOIS contact PII is deliberately never
@@ -401,7 +505,7 @@ sync_workers_txt() { # 0 = workers.txt refreshed; 1 = FAILED (previous file kept
   fi
 }
 
-sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar
+sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar | waf | notifications
   local tsel="${1:-}" rc
   ZIDX=1 ZTOTAL=1 ZNAME="(account)"
   echo
@@ -451,23 +555,114 @@ sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv |
     sync_registrar_txt || true  # HCL below is an independent pull — attempt it regardless
     gen_to    "terraform/account-registrar.tf"       "reg_@domain_name" cloudflare_registrar_domain --account "$ACCOUNT_ID"
   fi
+  if [ -z "$tsel" ] || [ "$tsel" = waf ]; then
+    # Lists are what WAF custom rules reference (ip.src in $name); items are
+    # generated per list. Account-level IP Access Rules apply to every zone.
+    gen_to    "terraform/account-waf-lists.tf"        "list_@name" cloudflare_list        --account "$ACCOUNT_ID"
+    sync_list_items
+    gen_to    "terraform/account-waf-access-rules.tf" "aar_"       cloudflare_access_rule --account "$ACCOUNT_ID"
+  fi
+  if [ -z "$tsel" ] || [ "$tsel" = notifications ]; then
+    gen_to    "terraform/account-notifications.tf"    "notif_"     cloudflare_notification_policy --account "$ACCOUNT_ID"
+  fi
 }
 
-is_zone_type()    { case "$1" in dns|rulesets|pagerules|settings) ;; *) return 1 ;; esac; }
-is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar) ;; *) return 1 ;; esac; }
+is_zone_type()    { case "$1" in dns|rulesets|pagerules|settings|waf) ;; *) return 1 ;; esac; }
+is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar|waf|notifications) ;; *) return 1 ;; esac; }
 
 check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account | any
   local t="${1:-}" scope="${2:-any}"
   [ -z "$t" ] && return 0
   case "$scope" in
     zone)    is_zone_type "$t" && return 0
-             echo "unknown type: $t (dns | rulesets | pagerules | settings)" >&2 ;;
+             echo "unknown type: $t (dns | rulesets | pagerules | settings | waf)" >&2 ;;
     account) is_account_type "$t" && return 0
-             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar)" >&2 ;;
+             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar | waf | notifications)" >&2 ;;
     *)       is_zone_type "$t" || is_account_type "$t" && return 0
-             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings; account: workers | d1 | r2 | kv | queues | registrar)" >&2 ;;
+             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings | waf; account: workers | d1 | r2 | kv | queues | registrar | waf | notifications)" >&2 ;;
   esac
   exit 1
+}
+
+# WAF-family zone config that lives OUTSIDE the rulesets API, concatenated into
+# one terraform/waf-<zone>.tf per zone. One cf-terraforming generate PER TYPE:
+# given a comma-separated --resource-type list, 0.28.0 stops at the first type
+# that has no resources (exit 0, later types silently missing — verified
+# 2026-09-02), so a combined call could masquerade as "rule deleted".
+# All-or-nothing like gen_multi: any failure keeps the previous file. Names are
+# zone-prefixed like settings (see stabilize). The zone's access-rule listing
+# also echoes account-wide rules (the dashboard shows both) and cf-terraforming
+# drops the scope attribute that tells them apart, so the generated blocks are
+# filtered down to the ids the API reports as zone-scoped — the account
+# artifact already holds the rest. bot_management and leaked_credential_check
+# are singletons, so the file always exists and a pull that lacks either is
+# treated as a failure (token scope or API drift), never as "removed".
+sync_waf() { # $1 = zone id, $2 = zone name
+  local zid="$1" out="terraform/waf-$2.tf" prefix tmp part rt lcc=0 ids code
+  prefix="$(echo "$2" | tr '.-' '__')_"
+  tmp=$(mktemp) part=$(mktemp)
+  : > "$tmp"
+  for rt in cloudflare_bot_management cloudflare_leaked_credential_check \
+            cloudflare_zone_lockdown cloudflare_access_rule cloudflare_user_agent_blocking_rule; do
+    if ! run_gen "$part" "$prefix" "$rt" --zone "$zid" </dev/null; then
+      gen_failed "$out" "after 3 attempts ($rt)"
+      rm -f "$tmp" "$part"
+      return 0
+    fi
+    case "$rt" in
+      cloudflare_bot_management|cloudflare_leaked_credential_check)
+        if ! grep -q "^resource \"$rt\" " "$part"; then
+          gen_failed "$out" "($rt block missing — token scope or API change?)"
+          rm -f "$tmp" "$part"
+          return 0
+        fi ;;
+      cloudflare_access_rule)
+        if [ -s "$part" ]; then
+          if ! ids=$(api "/zones/$zid/firewall/access_rules/rules?per_page=1000" | jq -r '
+               if .success == true and (.result | type) == "array"
+                  and ((.result_info.total_pages // 1) <= 1)
+               then .result[] | select(.scope.type == "zone") | .id
+               else error("unexpected access-rule list response") end'); then
+            gen_failed "$out" "to list zone access rules"
+            rm -f "$tmp" "$part"
+            return 0
+          fi
+          filter_blocks "$part" "$ids"
+        fi ;;
+    esac
+    cat "$part" >> "$tmp"
+    # Detection rules are only readable while the product is enabled (the
+    # API answers 400 "product has not been enabled" otherwise, which
+    # cf-terraforming treats as fatal) — gate on the flag just captured.
+    [ "$rt" = cloudflare_leaked_credential_check ] \
+      && grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true$' "$part" && lcc=1
+  done
+  # Custom detection locations are an Enterprise feature, so the detections
+  # endpoint may keep answering 4xx on a Free/Pro zone even with detection on.
+  # Probe it first: a 2xx means generate; any 4xx means "none available here"
+  # (never FAILED, which would freeze this zone's file); transport errors and
+  # 5xx are real failures.
+  if [ "$lcc" = 1 ]; then
+    code=$(curl -s -o /dev/null --retry 3 --max-time 15 -w '%{http_code}' \
+      -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+      "https://api.cloudflare.com/client/v4/zones/$zid/leaked-credential-checks/detections") || code=000
+    case "$code" in
+      2??) if run_gen "$part" "$prefix" cloudflare_leaked_credential_check_rule --zone "$zid" </dev/null; then
+             cat "$part" >> "$tmp"
+           else
+             gen_failed "$out" "after 3 attempts (cloudflare_leaked_credential_check_rule)"
+             rm -f "$tmp" "$part"
+             return 0
+           fi ;;
+      4??) ;;  # not entitled / not enabled at the API: no detection rules to capture
+      *)   gen_failed "$out" "to probe leaked-credential detections (HTTP $code)"
+           rm -f "$tmp" "$part"
+           return 0 ;;
+    esac
+  fi
+  commit_out "$out" "$tmp"
+  rm -f "$part"
+  return 0
 }
 
 sync_tf() { # $1 (optional) = single zone name; $2 (optional) = single type
@@ -496,6 +691,9 @@ sync_tf() { # $1 (optional) = single zone name; $2 (optional) = single type
       gen_to "terraform/settings-$zname.tf"  "${slug}_" cloudflare_zone_setting --zone "$zid" \
         --resource-id "cloudflare_zone_setting=$ids"
     fi
+    if [ -z "$tsel" ] || [ "$tsel" = waf ]; then
+      sync_waf "$zid" "$zname"
+    fi
   done < zones.txt
 }
 
@@ -514,31 +712,35 @@ type_menu() { # sets TYPE_SEL ("" = all types); Enter defaults to 0; number or n
   echo "  2 - rulesets"
   echo "  3 - pagerules"
   echo "  4 - settings"
+  echo "  5 - waf            (zone WAF settings + account WAF lists / access rules)"
   echo "Account-level types:"
-  echo "  5 - workers"
-  echo "  6 - d1"
-  echo "  7 - r2"
-  echo "  8 - kv"
-  echo "  9 - queues"
-  echo " 10 - registrar"
+  echo "  6 - workers"
+  echo "  7 - d1"
+  echo "  8 - r2"
+  echo "  9 - kv"
+  echo " 10 - queues"
+  echo " 11 - registrar"
+  echo " 12 - notifications"
   echo
   echo "  0 - ALL TYPES"
   echo
   while :; do
     read -rp "Sync which types (number or name)? [0]: " choice
     case "${choice:-0}" in
-      0)              TYPE_SEL="" ;;
-      1|dns)          TYPE_SEL="dns" ;;
-      2|rulesets)     TYPE_SEL="rulesets" ;;
-      3|pagerules)    TYPE_SEL="pagerules" ;;
-      4|settings)     TYPE_SEL="settings" ;;
-      5|workers)      TYPE_SEL="workers" ;;
-      6|d1)           TYPE_SEL="d1" ;;
-      7|r2)           TYPE_SEL="r2" ;;
-      8|kv)           TYPE_SEL="kv" ;;
-      9|queues)       TYPE_SEL="queues" ;;
-      10|registrar)   TYPE_SEL="registrar" ;;
-      *) echo "invalid selection: $choice — enter 0-10 or a type name" >&2; continue ;;
+      0)                TYPE_SEL="" ;;
+      1|dns)            TYPE_SEL="dns" ;;
+      2|rulesets)       TYPE_SEL="rulesets" ;;
+      3|pagerules)      TYPE_SEL="pagerules" ;;
+      4|settings)       TYPE_SEL="settings" ;;
+      5|waf)            TYPE_SEL="waf" ;;
+      6|workers)        TYPE_SEL="workers" ;;
+      7|d1)             TYPE_SEL="d1" ;;
+      8|r2)             TYPE_SEL="r2" ;;
+      9|kv)             TYPE_SEL="kv" ;;
+      10|queues)        TYPE_SEL="queues" ;;
+      11|registrar)     TYPE_SEL="registrar" ;;
+      12|notifications) TYPE_SEL="notifications" ;;
+      *) echo "invalid selection: $choice — enter 0-12 or a type name" >&2; continue ;;
     esac
     break
   done
@@ -553,7 +755,7 @@ menu() {
   max=$((i - 1))
   echo
   echo "  0 - ALL ZONES (+ account-level)"
-  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar)"
+  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar / waf / notifications)"
   echo
   while :; do
     read -rp "Sync what (number, zone name, or 'a')? [0]: " choice
@@ -581,10 +783,10 @@ menu() {
     if [ -z "$TYPE_SEL" ]; then
       sync_tf
       sync_account ""
-    elif is_zone_type "$TYPE_SEL"; then
-      sync_tf "" "$TYPE_SEL"
     else
-      sync_account "$TYPE_SEL"
+      # a type may exist at both scopes (waf): run each scope that has it
+      if is_zone_type "$TYPE_SEL";    then sync_tf "" "$TYPE_SEL"; fi
+      if is_account_type "$TYPE_SEL"; then sync_account "$TYPE_SEL"; fi
     fi
   else
     sync_tf "$zsel" ""
@@ -621,8 +823,10 @@ case "${1:-}" in
            if [ -t 0 ]; then menu; else sync_tf; sync_account ""; fi ;;
   all|tf)  check_type "${2:-}" any
            if [ -z "${2:-}" ]; then sync_zones; sync_tf; sync_account ""
-           elif is_zone_type "$2"; then sync_zones; sync_tf "" "$2"
-           else sync_account "$2"; fi ;;
+           else  # a type may exist at both scopes (waf): run each scope that has it
+             if is_zone_type "$2";    then sync_zones; sync_tf "" "$2"; fi
+             if is_account_type "$2"; then sync_account "$2"; fi
+           fi ;;
   account) check_type "${2:-}" account; sync_account "${2:-}" ;;
   zones)   sync_zones ;;
   *)       check_type "${2:-}" zone; sync_zones
