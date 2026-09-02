@@ -593,8 +593,10 @@ check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account |
 # zone-prefixed like settings (see stabilize). The zone's access-rule listing
 # also echoes account-wide rules (the dashboard shows both) and cf-terraforming
 # drops the scope attribute that tells them apart, so the generated blocks are
-# filtered down to the ids the API reports as zone-scoped — the account
-# artifact already holds the rest. bot_management and leaked_credential_check
+# filtered to drop the ids the API reports as account-scoped (scope.type
+# "organization") — the account artifact already holds those. Filtering by
+# exclusion means an unexpected scope label can only over-include, never lose
+# a zone rule. bot_management and leaked_credential_check
 # are singletons, so the file always exists and a pull that lacks either is
 # treated as a failure (token scope or API drift), never as "removed".
 sync_waf() { # $1 = zone id, $2 = zone name
@@ -621,7 +623,7 @@ sync_waf() { # $1 = zone id, $2 = zone name
           if ! ids=$(api "/zones/$zid/firewall/access_rules/rules?per_page=1000" | jq -r '
                if .success == true and (.result | type) == "array"
                   and ((.result_info.total_pages // 1) <= 1)
-               then .result[] | select(.scope.type == "zone") | .id
+               then .result[] | select((.scope.type // "") != "organization") | .id
                else error("unexpected access-rule list response") end'); then
             gen_failed "$out" "to list zone access rules"
             rm -f "$tmp" "$part"
