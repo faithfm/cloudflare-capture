@@ -34,6 +34,7 @@
 #                                  paused, assigned nameservers (tab-separated)
 #   workers.txt                    Worker inventory: <script-name> <created-date>
 #   registrar.txt                  Cloudflare-registered domains: <name> <registered> <expires>
+#   notifications.jsonl            notification policies, one JSON object per line
 #   terraform/dns-<zone>.tf        DNS records
 #   terraform/settings-<zone>.tf   zone settings (incl. SSL/TLS)
 #   terraform/rulesets-<zone>.tf   rulesets: redirect/transform/WAF/... phases
@@ -50,8 +51,7 @@
 #                                  cron triggers, D1 databases, R2 buckets & custom
 #                                  domains, KV namespaces, Queues & consumers,
 #                                  Registrar settings (auto-renew/lock/privacy),
-#                                  WAF lists + list items + account IP Access Rules,
-#                                  notification policies
+#                                  WAF lists + list items + account IP Access Rules
 # An empty result (e.g. zone has no page rules) produces no file, and removes a
 # stale one — absence of the file means "zone has none of these".
 # Deliberately NOT captured — wiring, not code/data: Worker script code + bindings
@@ -62,9 +62,12 @@
 # Worker routes and R2 CORS/lifecycle rules are unsupported by
 # cf-terraforming v0.28 — add jq-to-HCL fallbacks if ever used. R2 artifacts
 # report "skipped" until R2 is enabled on the account (dashboard toggle).
-# Notification webhook destinations are not captured either: their URLs are
-# bearer secrets (policies reference them by id only). Legacy rate limits and
-# firewall rules have no API any more (410 Gone / migrated to rulesets).
+# Notification policies are JSON lines, not HCL: the provider's alert_type enum
+# lags Cloudflare (5.24.0 still rejects the auto-created billing_budget_alert)
+# and one unknown value would fail `terraform validate` for the whole tree.
+# Webhook/PagerDuty destinations appear by id only (their URLs are bearer
+# secrets). Legacy rate limits and firewall rules have no API any more
+# (410 Gone / migrated to rulesets).
 # List ITEMS are rendered by this script, not cf-terraforming: their endpoint
 # is cursor-paginated and 0.28.0 only follows page/total_pages (it would emit
 # the first page only, exit 0) and it writes each item's own id into list_id.
@@ -483,6 +486,28 @@ sync_registrar_txt() { # 0 = registrar.txt refreshed; 1 = FAILED (previous file 
   fi
 }
 
+# Notification policies -> notifications.jsonl: one policy per line, keys
+# sorted recursively, ordered by id, timestamps dropped, destinations reduced
+# to ids (email addresses are ids and are kept: attribution, as in the audit
+# log). Never-clobber: replaced only after a fully successful pull.
+sync_notifications_jsonl() { # 0 = refreshed; 1 = FAILED (previous file kept)
+  local tmp
+  tmp=$(mktemp)
+  if api "/accounts/$ACCOUNT_ID/alerting/v3/policies" | jq -S -c '
+       if .success == true and (.result | type) == "array"
+          and ((.result_info.total_pages // 1) <= 1)
+       then .result | sort_by(.id)[] | del(.created, .modified)
+            | .mechanisms |= ((. // {}) | with_entries(.value |= map({id})))
+       else error("unexpected policy-list response") end' > "$tmp"; then
+    mv "$tmp" notifications.jsonl
+    echo "notification policies: $(wc -l < notifications.jsonl | tr -d ' ')"
+  else
+    rm -f "$tmp"
+    gen_failed notifications.jsonl "to list notification policies"
+    return 1
+  fi
+}
+
 # Worker inventory: stable fields only (name + creation date). Deliberately
 # excludes etag/modified_on (churn on every deploy) and code/bindings (each
 # app's own repo + wrangler are the source of truth for those). Never-clobber:
@@ -563,7 +588,7 @@ sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv |
     gen_to    "terraform/account-waf-access-rules.tf" "aar_"       cloudflare_access_rule --account "$ACCOUNT_ID"
   fi
   if [ -z "$tsel" ] || [ "$tsel" = notifications ]; then
-    gen_to    "terraform/account-notifications.tf"    "notif_"     cloudflare_notification_policy --account "$ACCOUNT_ID"
+    sync_notifications_jsonl || true
   fi
 }
 
