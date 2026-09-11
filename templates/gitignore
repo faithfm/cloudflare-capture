@@ -1,0 +1,5 @@
+.terraform/
+
+# OS junk
+.DS_Store
+._*

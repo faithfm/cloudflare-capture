@@ -2,11 +2,11 @@
 # Cloudflare audit-log archive — read-only capture of the account's change history.
 #
 # Usage:
-#   scripts/cf-audit-archive.sh          walk back until the log runs dry, merge, rewrite
-#   scripts/cf-audit-archive.sh <days>   only look back <days> (quick incremental top-up)
+#   cf-audit-archive          walk back until the log runs dry, merge, rewrite
+#   cf-audit-archive <days>   only look back <days> (quick incremental top-up)
 #
 # WHY THIS EXISTS, AND WHY IT MUST BE RUN PERIODICALLY
-# The audit log is the only record of *what changed when* — cf-sync.sh captures
+# The audit log is the only record of *what changed when* — cf-sync captures
 # state, never history. But Cloudflare's log is finite and rolls off: policy says
 # 18 months, and this account's log is additionally capped at 3000 entries over
 # 3 pages of 1000 (page 4 returns nothing, whatever the window). Every day of new
@@ -19,19 +19,54 @@
 # silently truncate the oldest end. This walks backwards in 15-day windows
 # instead, each far below the cap, and stops after 3 consecutive empty windows.
 #
-# Config + token: identical to cf-sync.sh — ACCOUNT_ID from cf-sync.conf, token
-# from $CLOUDFLARE_API_TOKEN or Keychain item 'cloudflare-api-token-<ACCOUNT_ID>'.
-# Read-only; needs no permission cf-sync.sh doesn't already use.
+# Config + token: identical to cf-sync — ACCOUNT_ID from cf-sync.conf (found by
+# walking up from the current directory), token from $CLOUDFLARE_API_TOKEN or
+# Keychain item 'cloudflare-api-token-<ACCOUNT_ID>'. Read-only; needs no
+# permission cf-sync doesn't already use.
 #
 # Output: audit-log.jsonl — one event per line, keys sorted, ordered by (when, id).
 # Deterministic and append-mostly, so a re-run shows up as added lines only.
 #
 # PII: actor.ip is stripped before writing. It is the one field in the payload
 # with no reconstruction value and real privacy weight (staff home IPs, in a repo
-# colleagues clone). Actor email is kept — it attributes changes, and it is work
-# email already present throughout this repo's git history.
+# colleagues clone). Actor email is kept — attribution is the point of the
+# archive — so keep capture repos private (see README).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+
+# Locate the capture repo: cf-sync.conf in this directory or any parent (the
+# way git finds .git), so the command works from anywhere inside one.
+find_capture_root() {
+  local d="$PWD"
+  while :; do
+    [ -f "$d/cf-sync.conf" ] && { printf '%s\n' "$d"; return 0; }
+    [ "$d" = "/" ] && return 1
+    d=$(dirname "$d")
+  done
+}
+
+# The checkout this command is symlinked from (install.sh symlinks bin/* into
+# ~/.local/bin); VERSION and templates/ live there. Resolved once, up front: a
+# relative $0 would resolve against the wrong directory after the cd into the
+# capture repo.
+tool_dir()     { local s; s=$(readlink -f "$0" 2>/dev/null) || s=$0; dirname "$(dirname "$s")"; }
+TOOL_DIR=$(tool_dir)
+tool_version() { cat "$TOOL_DIR/VERSION" 2>/dev/null || echo unknown; }
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,16p' "$0"
+  exit 0
+fi
+if [ -n "${1:-}" ] && ! [[ "$1" =~ ^[0-9]+$ ]]; then
+  echo "usage: cf-audit-archive [days] — days must be a whole number (see --help)" >&2
+  exit 1
+fi
+
+CAPTURE_ROOT=$(find_capture_root) || {
+  echo "Not inside a capture repo: no cf-sync.conf in this directory or any parent." >&2
+  echo "Run 'cf-sync init' in a new, empty directory to create one." >&2
+  exit 1
+}
+cd "$CAPTURE_ROOT"
 
 OUT=audit-log.jsonl
 WINDOW_DAYS=15
@@ -40,7 +75,6 @@ DRY_WINDOWS_TO_STOP=3
 
 command -v jq >/dev/null || { echo "jq is required — brew install jq" >&2; exit 1; }
 
-[ -f cf-sync.conf ] || { echo "cf-sync.conf not found (must run from the repo)" >&2; exit 1; }
 # shellcheck disable=SC1091
 . ./cf-sync.conf
 [ -n "${ACCOUNT_ID:-}" ] || { echo "ACCOUNT_ID not set in cf-sync.conf" >&2; exit 1; }
@@ -49,11 +83,14 @@ KEYCHAIN_SERVICE="cloudflare-api-token-$ACCOUNT_ID"
 if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
   CLOUDFLARE_API_TOKEN=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null) || {
     echo "No token in \$CLOUDFLARE_API_TOKEN or Keychain item '$KEYCHAIN_SERVICE'." >&2
-    echo "Run scripts/cf-sync.sh once to store one (runbook §0.2)." >&2
+    echo "Run cf-sync once to store one (see README)." >&2
     exit 1
   }
   export CLOUDFLARE_API_TOKEN
 fi
+
+printf '%s\n' "$(tool_version)" > .cf-capture-version
+echo "cloudflare-capture $(tool_version) · account $ACCOUNT_ID · $CAPTURE_ROOT"
 
 # BSD date: -v adjustments MUST precede -f, and the +format MUST be last —
 # any other order silently prints the unadjusted date in the default format.

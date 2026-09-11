@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
-# Cloudflare config sync — read-only capture of live config into this repo.
+# Cloudflare config sync — read-only capture of live config into a capture repo.
 #
 # Usage:
-#   scripts/cf-sync.sh                     interactive menus: zone/account, then type
-#                                          (Enter = default = ALL for both)
-#   scripts/cf-sync.sh all [type]          sync everything (non-interactive; alias: tf)
-#   scripts/cf-sync.sh <zone-name> [type]  sync one zone, e.g. example.com
-#   scripts/cf-sync.sh account [type]      account-level artifacts only
-#   scripts/cf-sync.sh zones               refresh the zone indexes only
+#   cf-sync                     interactive menus: zone/account, then type
+#                               (Enter = default = ALL for both)
+#   cf-sync all [type]          sync everything (non-interactive; alias: tf)
+#   cf-sync <zone-name> [type]  sync one zone, e.g. example.com
+#   cf-sync account [type]      account-level artifacts only
+#   cf-sync zones               refresh the zone indexes only
+#   cf-sync init [account-id]   scaffold a new capture repo in the current directory
 # type (zone):    dns | rulesets | pagerules | settings | waf   (omitted = all types)
 # type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications
 # With no argument and no terminal (cron/automation), behaves like "all".
-# Dependencies (jq, terraform, cf-terraforming) are checked on start; if missing,
-# the script prints the install commands and offers to run them via Homebrew.
+# Dependencies (jq, terraform, cf-terraforming) are checked on start; install.sh
+# installs them.
 #
 # Progress: one line per artifact —  [NN/NN] <zone> <type> <status (count)>
 # where status is NEW / UPDATED / unchanged / REMOVED / none / skipped / FAILED.
 #
-# Config: cf-sync.conf at the repo root (committed, mandatory) declares the ONE
-# per-repo setting — ACCOUNT_ID, the Cloudflare account this repo captures.
-# Everything account-specific derives from it, including the Keychain item name
-# 'cloudflare-api-token-<ACCOUNT_ID>', so this script is byte-identical across
-# per-account repos and features port by plain file copy.
+# Config: cf-sync.conf at the capture repo root (found by walking up from the
+# current directory; committed, mandatory) declares the ONE per-repo setting —
+# ACCOUNT_ID, the Cloudflare account that repo captures. Everything
+# account-specific derives from it, including the Keychain item name
+# 'cloudflare-api-token-<ACCOUNT_ID>', so one installed copy of this tool serves
+# any number of capture repos.
 #
 # Token: uses $CLOUDFLARE_API_TOKEN if already set, otherwise loads it from that
-# macOS Keychain item (runbook §0.2). Never writes it to disk. The token is
+# macOS Keychain item (see README). Never writes it to disk. The token is
 # verified to actually see $ACCOUNT_ID before any capture, so a wrong token in
-# the right slot can never capture the wrong account's config into this repo.
+# the right slot can never capture the wrong account's config into the capture repo.
 #
 # Layout it maintains (all committed):
 #   zones.txt                      fleet index: <zone-id> <zone-name>
@@ -35,6 +37,7 @@
 #   workers.txt                    Worker inventory: <script-name> <created-date>
 #   registrar.txt                  Cloudflare-registered domains: <name> <registered> <expires>
 #   notifications.jsonl            notification policies, one JSON object per line
+#   .cf-capture-version            cloudflare-capture version that made the last run
 #   terraform/dns-<zone>.tf        DNS records
 #   terraform/settings-<zone>.tf   zone settings (incl. SSL/TLS)
 #   terraform/rulesets-<zone>.tf   rulesets: redirect/transform/WAF/... phases
@@ -58,7 +61,7 @@
 # (each app's own repo + wrangler are the source of truth), D1 schema/data, R2
 # object contents, KV values, queue messages, secret values (write-only at the
 # API), WHOIS contact PII, and registration state for domains registered outside
-# this account (out of scope: this repo captures the account's own config).
+# this account (out of scope: capture covers the account's own config).
 # Worker routes and R2 CORS/lifecycle rules are unsupported by
 # cf-terraforming v0.28 — add jq-to-HCL fallbacks if ever used. R2 artifacts
 # report "skipped" until R2 is enabled on the account (dashboard toggle).
@@ -73,39 +76,40 @@
 # the first page only, exit 0) and it writes each item's own id into list_id.
 # Account-level Bulk Redirects are NOT captured — verify none exist in this account.
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-# Verify required tools exist; print runbook §0.1's install commands for any that
-# are missing and, when interactive, offer to run them via Homebrew right away.
+# Locate the capture repo: cf-sync.conf in this directory or any parent (the
+# way git finds .git), so the command works from anywhere inside one.
+find_capture_root() {
+  local d="$PWD"
+  while :; do
+    [ -f "$d/cf-sync.conf" ] && { printf '%s\n' "$d"; return 0; }
+    [ "$d" = "/" ] && return 1
+    d=$(dirname "$d")
+  done
+}
+
+# The checkout this command is symlinked from (install.sh symlinks bin/* into
+# ~/.local/bin); VERSION and templates/ live there. Resolved once, up front: a
+# relative $0 would resolve against the wrong directory after the cd into the
+# capture repo.
+tool_dir()     { local s; s=$(readlink -f "$0" 2>/dev/null) || s=$0; dirname "$(dirname "$s")"; }
+TOOL_DIR=$(tool_dir)
+tool_version() { cat "$TOOL_DIR/VERSION" 2>/dev/null || echo unknown; }
+
+# Verify required tools exist. Installing them is install.sh's job (Homebrew
+# where available); this only reports, so a missing tool fails fast and clearly.
 check_deps() {
-  local missing=() cmds=() m c ans
+  local missing=()
   command -v jq              >/dev/null || missing+=(jq)
   command -v terraform       >/dev/null || missing+=(terraform)
   command -v cf-terraforming >/dev/null || missing+=(cf-terraforming)
   [ ${#missing[@]} -eq 0 ] && return 0
   echo "Missing dependencies: ${missing[*]}" >&2
-  if ! command -v brew >/dev/null; then
-    echo "Homebrew is required to install them — see https://brew.sh, then re-run." >&2
-    exit 1
-  fi
-  for m in "${missing[@]}"; do
-    case "$m" in
-      jq)              cmds+=("brew install jq") ;;
-      terraform)       cmds+=("brew tap hashicorp/tap && brew install hashicorp/tap/terraform") ;;
-      cf-terraforming) cmds+=("brew tap cloudflare/cloudflare && brew install cloudflare/cloudflare/cf-terraforming") ;;
-    esac
-  done
-  printf '  %s\n' "${cmds[@]}" >&2
-  if [ ! -t 0 ]; then
-    echo "Non-interactive run — install the above and re-run." >&2
-    exit 1
-  fi
-  read -rp "Install now via Homebrew? [Y/n]: " ans
-  case "${ans:-Y}" in [Yy]*) ;; *) exit 1 ;; esac
-  for c in "${cmds[@]}"; do eval "$c"; done
-  for m in "${missing[@]}"; do
-    command -v "$m" >/dev/null || { echo "$m still missing after install — aborting." >&2; exit 1; }
-  done
+  echo "Run install.sh from the cloudflare-capture checkout ($TOOL_DIR), or by hand:" >&2
+  echo "  brew install jq" >&2
+  echo "  brew tap hashicorp/tap && brew install hashicorp/tap/terraform" >&2
+  echo "  brew tap cloudflare/cloudflare && brew install cloudflare/cloudflare/cf-terraforming" >&2
+  exit 1
 }
 
 verify_token() { # 0 = valid, 1 = rejected, 2 = Cloudflare unreachable
@@ -138,7 +142,7 @@ ensure_token() {
       echo "No Cloudflare API token found (env or Keychain item '$KEYCHAIN_SERVICE')."
     fi
     if [ ! -t 0 ]; then
-      echo "Non-interactive run — cannot prompt for a token. See runbook §0.2." >&2
+      echo "Non-interactive run — cannot prompt for a token. Set CLOUDFLARE_API_TOKEN, or run cf-sync once interactively to store one (see README)." >&2
       exit 1
     fi
     read -rp "Store a new token in the Keychain now? [Y/n]: " ans
@@ -331,7 +335,7 @@ sync_zones() {
 
 # Verify the token can actually see the configured account. Guards every sync
 # (zones included): a token for the WRONG account would otherwise capture that
-# account's config straight over this repo's files. The Keychain slot name is
+# account's config over the capture repo's files. The Keychain slot name is
 # derived from $ACCOUNT_ID so mix-ups are unlikely, but the $CLOUDFLARE_API_TOKEN
 # env override bypasses that naming — this check closes the gap.
 ensure_account() {
@@ -466,7 +470,7 @@ filter_blocks() {
 # and expiry dates. The managed settings (auto-renew/lock/privacy) live in
 # terraform/account-registrar.tf; WHOIS contact PII is deliberately never
 # captured. Domains registered OUTSIDE this account (e.g. at another registrar)
-# are out of scope by design — this repo captures the account's own config.
+# are out of scope by design — capture covers the account's own config.
 sync_registrar_txt() { # 0 = registrar.txt refreshed; 1 = FAILED (previous file kept)
   local tmp
   tmp=$(mktemp)
@@ -820,18 +824,75 @@ menu() {
   fi
 }
 
+# cf-sync init [account-id]: scaffold a capture repo in the current directory
+# from the tool's templates/ (cf-sync.conf, .gitignore, README.md, and the
+# Terraform provider pin + lock file), then make its first commit. Purely local:
+# needs git, not the API. Refuses inside an existing capture repo, and refuses
+# to overwrite anything: every target is checked before the first write.
+init_repo() {
+  local id="${1:-}" root f tpl="$TOOL_DIR/templates" existing=()
+  local files=(cf-sync.conf .gitignore README.md terraform/provider.tf terraform/.terraform.lock.hcl)
+  if root=$(find_capture_root); then
+    echo "Already inside a capture repo at $root." >&2
+    exit 1
+  fi
+  command -v git >/dev/null || { echo "cf-sync init needs git." >&2; exit 1; }
+  [ -d "$tpl" ] || { echo "Templates not found at $tpl — is the cloudflare-capture checkout intact?" >&2; exit 1; }
+  if [ -z "$id" ]; then
+    read -rp "Cloudflare account id (dashboard -> account home -> copy Account ID): " id || true
+  fi
+  if ! [[ "$id" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "cf-sync.conf must set ACCOUNT_ID to the 32-hex Cloudflare account id" >&2
+    exit 1
+  fi
+  for f in "${files[@]}"; do
+    if [ -e "$f" ]; then existing+=("$f"); fi
+  done
+  if [ ${#existing[@]} -gt 0 ]; then
+    echo "Refusing to overwrite existing files:" >&2
+    printf '  %s\n' "${existing[@]}" >&2
+    exit 1
+  fi
+  mkdir -p terraform
+  sed "s/__ACCOUNT_ID__/$id/" "$tpl/cf-sync.conf" > cf-sync.conf
+  sed "s/__ACCOUNT_ID__/$id/" "$tpl/README.md"    > README.md
+  cp "$tpl/gitignore"          .gitignore
+  cp "$tpl/provider.tf"        terraform/provider.tf
+  cp "$tpl/terraform.lock.hcl" terraform/.terraform.lock.hcl
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git init -b main >/dev/null 2>&1 || git init >/dev/null
+  fi
+  # Commit exactly these paths, so anything already staged in an enclosing
+  # repo stays staged and out of this commit.
+  git add -- "${files[@]}"
+  if ! git commit -q -m "cf-sync init: capture repo scaffold (cloudflare-capture $(tool_version))" -- "${files[@]}"; then
+    echo "Scaffold written and staged, but the commit failed (see git's message above)." >&2
+    echo "Fix that, then: git commit -m 'cf-sync init: capture repo scaffold'" >&2
+    exit 1
+  fi
+  echo "Capture repo ready in $PWD. Next: cf-sync (interactive) or cf-sync all."
+}
+
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-  sed -n '2,18p' "$0"
+  sed -n '2,19p' "$0"
+  exit 0
+fi
+
+# init runs before the capture-repo lookup (a new repo has no cf-sync.conf yet)
+# and before the dependency and token checks: it is purely local.
+if [ "${1:-}" = init ]; then
+  init_repo "${2:-}"
   exit 0
 fi
 
 # Mandatory per-repo config — no defaults: refusing to run beats capturing the
 # wrong account's config into the wrong repo. See the Config note in the header.
-if [ ! -f cf-sync.conf ]; then
-  echo "Missing cf-sync.conf — create it at the repo root with:" >&2
-  echo "  ACCOUNT_ID=<32-hex account id>   # dashboard -> account home -> copy Account ID" >&2
+CAPTURE_ROOT=$(find_capture_root) || {
+  echo "Not inside a capture repo: no cf-sync.conf in this directory or any parent." >&2
+  echo "Run 'cf-sync init' in a new, empty directory to create one." >&2
   exit 1
-fi
+}
+cd "$CAPTURE_ROOT"
 # shellcheck disable=SC1091
 . ./cf-sync.conf
 if ! [[ "${ACCOUNT_ID:-}" =~ ^[0-9a-f]{32}$ ]]; then
@@ -844,6 +905,9 @@ check_deps
 TFBIN=$(command -v terraform)
 ensure_token
 ensure_account
+
+printf '%s\n' "$(tool_version)" > .cf-capture-version
+echo "cloudflare-capture $(tool_version) · account $ACCOUNT_ID · $CAPTURE_ROOT"
 
 case "${1:-}" in
   "")      sync_zones

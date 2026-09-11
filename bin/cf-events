@@ -2,7 +2,7 @@
 # Cloudflare security events — read-only daily review from the terminal.
 #
 # Usage:
-#   scripts/cf-events.sh <zone-name> [hours] [limit]
+#   cf-events <zone-name> [hours] [limit]
 #     hours  = look-back window, default 24 (Security Events on Pro keeps 24 h)
 #     limit  = rows per table, default 40
 #
@@ -12,21 +12,36 @@
 #      traffic here = a false positive to fix with a per-rule exception.
 #   2. LEDGER — the logging Skip "probe" rules: what non-browser / API / login
 #      traffic looks like before anything tightens.
-# Reads the same read-only token as cf-sync.sh (Keychain or $CLOUDFLARE_API_TOKEN);
+# Reads the same read-only token as cf-sync (Keychain or $CLOUDFLARE_API_TOKEN);
 # never writes anything. Zone name is resolved through zones.txt.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+
+# Locate the capture repo: cf-sync.conf in this directory or any parent (the
+# way git finds .git), so the command works from anywhere inside one.
+find_capture_root() {
+  local d="$PWD"
+  while :; do
+    [ -f "$d/cf-sync.conf" ] && { printf '%s\n' "$d"; return 0; }
+    [ "$d" = "/" ] && return 1
+    d=$(dirname "$d")
+  done
+}
 
 zone="${1:-}"; hours="${2:-24}"; limit="${3:-40}"
 if [ -z "$zone" ] || [ "$zone" = "-h" ] || [ "$zone" = "--help" ]; then
   sed -n '2,16p' "$0"; exit 0
 fi
+CAPTURE_ROOT=$(find_capture_root) || {
+  echo "Not inside a capture repo: no cf-sync.conf in this directory or any parent." >&2
+  echo "Run 'cf-sync init' in a new, empty directory to create one." >&2
+  exit 1
+}
+cd "$CAPTURE_ROOT"
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
-[ -f cf-sync.conf ] || { echo "Missing cf-sync.conf — run from a capture repo." >&2; exit 1; }
 # shellcheck disable=SC1091
 . ./cf-sync.conf
 zid=$(awk -v z="$zone" '$2==z{print $1}' zones.txt)
-[ -n "$zid" ] || { echo "unknown zone: $zone (not in zones.txt — run scripts/cf-sync.sh zones)" >&2; exit 1; }
+[ -n "$zid" ] || { echo "unknown zone: $zone (not in zones.txt — run cf-sync zones)" >&2; exit 1; }
 if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
   CLOUDFLARE_API_TOKEN=$(security find-generic-password -s "cloudflare-api-token-$ACCOUNT_ID" -w 2>/dev/null) \
     || { echo "No token in env or Keychain item cloudflare-api-token-$ACCOUNT_ID" >&2; exit 1; }
