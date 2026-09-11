@@ -311,11 +311,14 @@ gen_multi() {
 # don't include: plan tier, status, type, paused flag, assigned nameservers —
 # the delegation baseline to verify against each domain's registrar). Both are
 # built in temp files and installed only after every page pulls successfully.
+# Listed for $ACCOUNT_ID only: one token can span several accounts (the Read
+# All Resources template covers all of the user's accounts by default), and
+# ensure_account proves only that the token can see this one.
 sync_zones() {
   local page=1 total resp ztmp mtmp
   ztmp=$(mktemp) mtmp=$(mktemp)
   while :; do
-    resp=$(api "/zones?per_page=50&page=$page")
+    resp=$(api "/zones?account.id=$ACCOUNT_ID&per_page=50&page=$page")
     if ! jq -e '.success == true and (.result | type) == "array"' <<<"$resp" >/dev/null 2>&1; then
       rm -f "$ztmp" "$mtmp"
       echo "unexpected zone-list response (page $page) — kept previous zone indexes" >&2
@@ -342,6 +345,17 @@ ensure_account() {
   api "/accounts/$ACCOUNT_ID" >/dev/null 2>&1 && return 0
   echo "token cannot access account $ACCOUNT_ID — check cf-sync.conf and Keychain item '$KEYCHAIN_SERVICE'." >&2
   exit 1
+}
+
+# cf-terraforming reads the provider schema from an initialised terraform/, and
+# .terraform/ is gitignored, so a new capture repo, or any fresh clone of one,
+# has none. Initialise it once, against the committed lock file, which
+# -lockfile=readonly guarantees is never changed.
+ensure_tf_init() {
+  [ -d terraform/.terraform/providers ] && return 0
+  echo "initialising terraform/ (first capture in this checkout; downloads the Cloudflare provider)"
+  "$TFBIN" -chdir=terraform init -backend=false -input=false -lockfile=readonly >/dev/null \
+    || { echo "terraform init failed in terraform/ — run it there by hand to see why." >&2; exit 1; }
 }
 
 # R2 endpoints error until the product is enabled on the account (dashboard
@@ -696,6 +710,16 @@ sync_waf() { # $1 = zone id, $2 = zone name
   return 0
 }
 
+# zone_setting won't enumerate itself: list the zone's setting ids for it. Asserts
+# the envelope like the account listers, so a failed or empty listing reports
+# FAILED and keeps the previous file instead of aborting the run.
+zone_setting_ids() { # $1 = zone id; comma-joined, sorted for deterministic output order
+  api "/zones/$1/settings" | jq -r '
+    if .success == true and (.result | type) == "array" and (.result | length) > 0
+    then .result[].id
+    else error("unexpected zone-settings response") end' | sort | paste -sd, -
+}
+
 sync_tf() { # $1 (optional) = single zone name; $2 (optional) = single type
   local filter="${1:-}" tsel="${2:-}" ids slug zid zname
   if [ -n "$filter" ]; then ZTOTAL=1; else ZTOTAL=$(wc -l < zones.txt | tr -d ' '); fi
@@ -718,9 +742,12 @@ sync_tf() { # $1 (optional) = single zone name; $2 (optional) = single type
       # zone_setting won't enumerate itself — feed it the zone's setting ids (sorted
       # for deterministic output order); zone-prefix the names (see stabilize)
       slug=$(echo "$zname" | tr '.-' '__')
-      ids=$(api "/zones/$zid/settings" | jq -r '.result[].id' | sort | paste -sd, -)
-      gen_to "terraform/settings-$zname.tf"  "${slug}_" cloudflare_zone_setting --zone "$zid" \
-        --resource-id "cloudflare_zone_setting=$ids"
+      if ids=$(zone_setting_ids "$zid"); then
+        gen_to "terraform/settings-$zname.tf"  "${slug}_" cloudflare_zone_setting --zone "$zid" \
+          --resource-id "cloudflare_zone_setting=$ids"
+      else
+        gen_failed "terraform/settings-$zname.tf" "to list zone settings"
+      fi
     fi
     if [ -z "$tsel" ] || [ "$tsel" = waf ]; then
       sync_waf "$zid" "$zname"
@@ -908,6 +935,7 @@ ensure_account
 
 printf '%s\n' "$(tool_version)" > .cf-capture-version
 echo "cloudflare-capture $(tool_version) · account $ACCOUNT_ID · $CAPTURE_ROOT"
+[ "${1:-}" = zones ] || ensure_tf_init
 
 case "${1:-}" in
   "")      sync_zones
