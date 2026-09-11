@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# cloudflare-capture installer: symlinks the commands (this one included) onto
+# PATH, installs their dependencies (jq, terraform, cf-terraforming), and keeps
+# the checkout up to date.
+#
+# Usage:
+#   cf-install              install or re-install; on a re-run, offers any available update
+#   cf-install --update     fetch and update without asking (refuses if the checkout has local work)
+#   cf-install --uninstall  remove this checkout's symlinks (a PATH line it added stays)
+#   After a fresh clone, ./install.sh is the same as cf-install.
+#
+# Commands are symlinked, not copied, into $INSTALL_DIR (default ~/.local/bin),
+# so the checkout is the installation. No sudo. If the install dir is not on
+# PATH, it asks (interactive runs only) before adding one line to your shell's
+# startup file.
+set -euo pipefail
+
+s=$(readlink -f "$0" 2>/dev/null) || s=$0
+TOOL=$(cd "$(dirname "$s")/.." && pwd -P)
+CMDS="cf-sync cf-audit-archive cf-events cf-install"
+
+# ours <link> <command>: true if <link> is a symlink to this checkout's <command>
+ours() { [ -L "$1" ] && [ "$(readlink "$1")" = "$TOOL/bin/$2" ]; }
+
+# Where the commands go: $INSTALL_DIR if set; else the directory of the symlink
+# this was run through, so re-running or updating an install elsewhere (say
+# /usr/local/bin) stays there; else ~/.local/bin. Exported because an update
+# hands over to the new installer, which must land in the same place.
+if [ -z "${INSTALL_DIR:-}" ]; then
+  if ours "$0" cf-install; then INSTALL_DIR=$(cd "$(dirname "$0")" && pwd)
+  else INSTALL_DIR="$HOME/.local/bin"; fi
+fi
+export INSTALL_DIR
+
+version() { cat "$TOOL/VERSION" 2>/dev/null || echo unknown; }
+
+# The line cf-install adds to a startup file is marked, so it can be recognised.
+MARK="# cloudflare-capture: user commands on PATH (added by cf-install)"
+tilde() { case "$1" in "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}" ;; *) printf '%s\n' "$1" ;; esac; }
+
+# rc_file: the one startup file this shell reads, or nothing for shells whose
+# file is not ours to edit (fish, anything unknown, $SHELL unset).
+rc_file() {
+  local f
+  case "${SHELL##*/}" in
+    zsh) echo "$HOME/.zshrc" ;;
+    bash)
+      if [ "$(uname -s)" = Darwin ]; then
+        # macOS terminals open login shells, which read only the first of these
+        # that exists: never create one that would shadow another.
+        for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+          if [ -e "$f" ]; then echo "$f"; return 0; fi
+        done
+        echo "$HOME/.bash_profile"
+      else
+        echo "$HOME/.bashrc"
+      fi ;;
+  esac
+}
+
+MODE=install
+case "${1:-}" in
+  -h|--help)
+    awk 'NR > 1 && /^set -euo pipefail/ { exit } NR > 1 { print }' "$0"
+    exit 0 ;;
+  --uninstall)
+    for c in $CMDS; do
+      l="$INSTALL_DIR/$c"
+      if ours "$l" "$c"; then
+        rm "$l"
+        echo "removed            $l"
+      elif [ -e "$l" ] || [ -L "$l" ]; then
+        echo "left alone         $l (not a symlink into $TOOL)"
+      else
+        echo "not installed      $l"
+      fi
+    done
+    for f in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "$HOME/.bashrc"; do
+      if [ -f "$f" ] && grep -qxF "$MARK" "$f"; then echo "PATH line in $(tilde "$f") left in place"; fi
+    done
+    exit 0 ;;
+  --update) MODE=update ;;
+  "") ;;
+  *) echo "unknown option: $1 (see --help)" >&2; exit 1 ;;
+esac
+
+# Updates. The checkout is changed only while it is a pure mirror of its
+# upstream: a clean tree whose HEAD upstream already had before this run
+# fetched. Then a hard reset follows upstream wherever it went, force-pushes
+# included. Anything else (uncommitted changes, local commits) is refused with
+# the reason, so a developer's work is never touched. Nothing is git-cleaned.
+#
+# First: can this checkout be checked at all, and where did its upstream stand
+# before any fetch (UP_BEFORE)? $TOOL must be the top of its own repository: a
+# copy unpacked inside some other repository is never treated as a checkout.
+UP_BEFORE="" SKIP="" REFUSE=""
+if ! command -v git >/dev/null; then
+  SKIP="git not found"; REFUSE="git not found — install git to update."
+elif [ ! -e "$TOOL/.git" ]; then
+  SKIP="not a git checkout"; REFUSE="not a git checkout — re-download it to update."
+elif [ "$(git -C "$TOOL" rev-parse --show-toplevel 2>/dev/null)" != "$TOOL" ]; then
+  SKIP="git cannot use this checkout"; REFUSE="git cannot use this checkout — see: git -C \"$TOOL\" status"
+elif ! UP_BEFORE=$(git -C "$TOOL" rev-parse -q --verify '@{u}' 2>/dev/null); then
+  UP_BEFORE=""; SKIP="no upstream branch"; REFUSE="no upstream branch — update it by hand."
+fi
+
+behind() { git -C "$TOOL" rev-list --count 'HEAD..@{u}'; }
+
+# Why this checkout must not be reset, or nothing when it is a pure mirror.
+# "Behind what upstream had" still counts as a mirror: that is where a declined
+# update leaves it.
+local_work() {
+  if [ -n "$(git -C "$TOOL" status --porcelain --untracked-files=no)" ]; then
+    echo "the checkout has uncommitted changes — commit or stash them, then re-run"
+  elif ! git -C "$TOOL" merge-base --is-ancestor HEAD "$UP_BEFORE"; then
+    echo "the checkout has local commits not on the remote — update it by hand (git pull --rebase, or reset it yourself)"
+  fi
+}
+
+# Reset to the fetched upstream tip, then hand over to the new installer so
+# new commands and dependencies are picked up.
+apply_update() {
+  local before new
+  before=$(version)
+  new=$(git -C "$TOOL" rev-parse '@{u}')
+  git -C "$TOOL" reset -q --hard "$new"
+  echo "updated            $before -> $(version)"
+  exec "$TOOL/bin/cf-install"
+}
+
+# --update: no question, and any refusal is an error.
+update_now() {
+  local why
+  [ -z "$REFUSE" ] || { echo "$REFUSE" >&2; exit 1; }
+  git -C "$TOOL" fetch -q || { echo "could not reach the remote" >&2; exit 1; }
+  if [ "$(behind)" = 0 ]; then echo "already up to date $(version)"; return 0; fi
+  why=$(local_work)
+  [ -z "$why" ] || { echo "$why." >&2; exit 1; }
+  apply_update
+}
+
+# A bare re-run: check, and ask before changing anything.
+update_check() {
+  local n cur new why ans
+  if [ -n "$SKIP" ]; then echo "update check       skipped ($SKIP)"; return 0; fi
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$TOOL" fetch -q 2>/dev/null; then
+    echo "update check       skipped (could not reach the remote)"; return 0
+  fi
+  n=$(behind)
+  if [ "$n" = 0 ]; then echo "up to date         $(version)"; return 0; fi
+  cur=$(version)
+  new=$(git -C "$TOOL" show '@{u}:VERSION' 2>/dev/null || echo unknown)
+  why=$(local_work)
+  if [ -n "$why" ]; then echo "update available   $cur -> $new, but $why"; return 0; fi
+  if [ -t 0 ]; then
+    read -rp "Update available ($cur -> $new, $n commit(s)). Install it now? [Y/n] " ans || ans=n
+    case "${ans:-Y}" in [Yy]*) apply_update ;; esac
+  fi
+  echo "update available   $cur -> $new — run: cf-install --update"
+}
+
+if [ "$MODE" = update ]; then update_now; fi
+
+# 1. Commands. Refuse up front, before linking anything, if a command name is
+# taken by a real file; a symlink (e.g. from an older checkout) is re-pointed.
+for c in $CMDS; do
+  l="$INSTALL_DIR/$c"
+  if [ -e "$l" ] && [ ! -L "$l" ]; then
+    echo "$l exists and is not a symlink — refusing to replace it; move it aside and re-run." >&2
+    exit 1
+  fi
+done
+mkdir -p "$INSTALL_DIR"
+for c in $CMDS; do
+  l="$INSTALL_DIR/$c"
+  if ours "$l" "$c"; then
+    echo "already installed  $l"
+  elif [ -L "$l" ]; then
+    was=$(readlink "$l")
+    ln -sfn "$TOOL/bin/$c" "$l"
+    echo "re-pointed         $l -> $TOOL/bin/$c (was -> $was)"
+  else
+    ln -sfn "$TOOL/bin/$c" "$l"
+    echo "installed          $l -> $TOOL/bin/$c"
+  fi
+done
+
+# 2. Dependencies: Homebrew where available (macOS, or Linuxbrew), otherwise
+# the official sources. Missing tools never abort the install.
+deps_missing() {
+  local d m=""
+  for d in jq terraform cf-terraforming; do command -v "$d" >/dev/null || m="$m $d"; done
+  echo "${m# }"
+}
+missing=$(deps_missing)
+if [ -z "$missing" ]; then
+  echo "dependencies       jq, terraform, cf-terraforming: all present"
+else
+  echo "Missing dependencies: $missing"
+  cmds=()
+  for m in $missing; do
+    case "$m" in
+      jq)              cmds+=("brew install jq") ;;
+      terraform)       cmds+=("brew tap hashicorp/tap && brew install hashicorp/tap/terraform") ;;
+      cf-terraforming) cmds+=("brew tap cloudflare/cloudflare && brew install cloudflare/cloudflare/cf-terraforming") ;;
+    esac
+  done
+  if command -v brew >/dev/null; then
+    printf '  %s\n' "${cmds[@]}"
+    if [ -t 0 ]; then
+      read -rp "Install now via Homebrew? [Y/n]: " ans
+      case "${ans:-Y}" in
+        [Yy]*)
+          for c in "${cmds[@]}"; do eval "$c"; done
+          missing=$(deps_missing)
+          if [ -z "$missing" ]; then echo "dependencies       all present"
+          else echo "Still missing: $missing — install by hand before running cf-sync."; fi ;;
+        *) echo "Skipped: install them before running cf-sync." ;;
+      esac
+    else
+      echo "Non-interactive run: install them before running cf-sync."
+    fi
+  else
+    echo "Homebrew not found (https://brew.sh). With Homebrew:"
+    printf '  %s\n' "${cmds[@]}"
+    echo "Or from the official sources:"
+    echo "  jq:              your package manager (e.g. apt install jq)"
+    echo "  terraform:       https://developer.hashicorp.com/terraform/install"
+    echo "  cf-terraforming: https://github.com/cloudflare/cf-terraforming/releases"
+  fi
+fi
+
+# 3. Updates: a bare re-run checks and asks; --update has already run above.
+if [ "$MODE" = install ]; then update_check; fi
+
+# 4. PATH. If the install dir is not on PATH, offer (interactive runs only) to
+# add one line to the one startup file this shell actually reads. Declining, a
+# non-interactive run, fish or an unknown shell all print the line instead.
+path_step() {
+  local rc line want dir ans
+  case ":$PATH:" in *":$INSTALL_DIR:"*) return 0 ;; esac
+  dir=$(tilde "$INSTALL_DIR")
+  if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then
+    line='export PATH="$HOME/.local/bin:$PATH"'; want=".local/bin"
+  else
+    line="export PATH=\"$INSTALL_DIR:\$PATH\""; want="$INSTALL_DIR"
+  fi
+  echo
+  if [ "${SHELL##*/}" = fish ]; then
+    echo "$dir is not on your PATH. For fish, run once:"
+    echo "  fish_add_path $INSTALL_DIR"
+    return 0
+  fi
+  rc=$(rc_file)
+  if [ -z "$rc" ]; then
+    echo "$dir is not on your PATH. Add this line to your shell's startup file:"
+    echo "  $line"
+    return 0
+  fi
+  if [ -f "$rc" ] && grep -qF -e "$want" -e "$MARK" "$rc"; then
+    echo "$(tilde "$rc") already references $dir — open a new terminal."
+    return 0
+  fi
+  if [ -t 0 ]; then
+    read -rp "$dir is not on your PATH. Add it to $(tilde "$rc")? [Y/n] " ans || ans=n
+    case "${ans:-Y}" in
+      [Yy]*)
+        printf '\n%s\n%s\n' "$MARK" "$line" >> "$rc"
+        echo "Added to $(tilde "$rc"). Open a new terminal, or run: source $(tilde "$rc")"
+        return 0 ;;
+    esac
+  fi
+  echo "$dir is not on your PATH. Add this line to $(tilde "$rc"), then open a new terminal:"
+  echo "  $line"
+}
+path_step
+
+echo
+echo "Next: create a capture repo for a Cloudflare account —"
+echo "  mkdir my-cloudflare-capture && cd my-cloudflare-capture"
+echo "  cf-sync init"
+echo "  cf-sync"
+echo "Updates: run cf-install again (it asks before installing one), or cf-install --update."

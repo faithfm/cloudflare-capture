@@ -12,7 +12,7 @@
 # type (zone):    dns | rulesets | pagerules | settings | waf   (omitted = all types)
 # type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications
 # With no argument and no terminal (cron/automation), behaves like "all".
-# Dependencies (jq, terraform, cf-terraforming) are checked on start; install.sh
+# Dependencies (jq, terraform, cf-terraforming) are checked on start; cf-install
 # installs them.
 #
 # Progress: one line per artifact —  [NN/NN] <zone> <type> <status (count)>
@@ -88,7 +88,7 @@ find_capture_root() {
   done
 }
 
-# The checkout this command is symlinked from (install.sh symlinks bin/* into
+# The checkout this command is symlinked from (cf-install symlinks bin/* into
 # ~/.local/bin); VERSION and templates/ live there. Resolved once, up front: a
 # relative $0 would resolve against the wrong directory after the cd into the
 # capture repo.
@@ -96,7 +96,7 @@ tool_dir()     { local s; s=$(readlink -f "$0" 2>/dev/null) || s=$0; dirname "$(
 TOOL_DIR=$(tool_dir)
 tool_version() { cat "$TOOL_DIR/VERSION" 2>/dev/null || echo unknown; }
 
-# Verify required tools exist. Installing them is install.sh's job (Homebrew
+# Verify required tools exist. Installing them is cf-install's job (Homebrew
 # where available); this only reports, so a missing tool fails fast and clearly.
 check_deps() {
   local missing=()
@@ -105,7 +105,7 @@ check_deps() {
   command -v cf-terraforming >/dev/null || missing+=(cf-terraforming)
   [ ${#missing[@]} -eq 0 ] && return 0
   echo "Missing dependencies: ${missing[*]}" >&2
-  echo "Run install.sh from the cloudflare-capture checkout ($TOOL_DIR), or by hand:" >&2
+  echo "Run cf-install (or $TOOL_DIR/install.sh), or by hand:" >&2
   echo "  brew install jq" >&2
   echo "  brew tap hashicorp/tap && brew install hashicorp/tap/terraform" >&2
   echo "  brew tap cloudflare/cloudflare && brew install cloudflare/cloudflare/cf-terraforming" >&2

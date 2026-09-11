@@ -44,7 +44,7 @@ find_capture_root() {
   done
 }
 
-# The checkout this command is symlinked from (install.sh symlinks bin/* into
+# The checkout this command is symlinked from (cf-install symlinks bin/* into
 # ~/.local/bin); VERSION and templates/ live there. Resolved once, up front: a
 # relative $0 would resolve against the wrong directory after the cd into the
 # capture repo.
