@@ -7,7 +7,7 @@ clean, per-record `git diff`.
 
 Nothing here runs `terraform apply`, and there is no Terraform state. HCL is simply the storage
 format: it covers the full configuration (DNS records including the proxied flag, zone settings,
-rulesets, WAF, account-level wiring), and `terraform validate` can check the whole tree.
+rulesets, WAF, tunnels, account-level wiring), and `terraform validate` can check the whole tree.
 
 One installed copy of the tool serves any number of accounts. Each account gets its own
 **capture repo**, which holds only data: `cf-sync.conf` (one setting, the account id) plus what
@@ -89,7 +89,7 @@ cf-sync zones                    refresh the zone indexes only
 cf-sync init [account-id]        scaffold a new capture repo in the current directory
 
 type (zone)    = dns | rulesets | pagerules | settings | waf
-type (account) = workers | d1 | r2 | kv | queues | registrar | waf | notifications
+type (account) = workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels
 ```
 
 ```text
@@ -136,6 +136,7 @@ git commit -am "describe the change"
 | `terraform/pagerules-<zone>.tf` | Legacy Page Rules (absent = zone has none) |
 | `terraform/waf-<zone>.tf` | WAF-family settings held outside the rulesets API: Bot Fight Mode / Super Bot Fight Mode, leaked-credential detection (+ its custom detection rules), IP Access Rules, Zone Lockdowns, User Agent Blocking (always present; the rule kinds appear only when the zone has some) |
 | `terraform/account-*.tf` | Account-level config: Workers custom domains & cron triggers, D1 databases, R2 buckets & custom domains, KV namespaces, Queues & consumers, Registrar settings, WAF lists + list items + account-level IP Access Rules (absent = account has none) |
+| `terraform/account-tunnel*.tf` | Cloudflare Tunnels: each tunnel's name and whether it is configured in the dashboard or locally (`account-tunnels.tf`); each dashboard-configured tunnel's published applications, its ingress rules with their origin parameters (`account-tunnel-configs.tf`); private-network routes and virtual networks (`account-tunnel-routes.tf`, `account-tunnel-vnets.tf`). Never tunnel secrets or run tokens (absent = account has none) |
 
 An empty result produces no file, and removes a stale one: absence means "none of these".
 
@@ -144,8 +145,9 @@ An empty result produces no file, and removes a stale one: absence means "none o
 A capture repo is a detailed map of your infrastructure, and it contains personal data.
 `audit-log.jsonl` records the email address of everyone who has changed the account, third
 parties included, and `notifications.jsonl` holds alert recipients' addresses. The DNS files
-expose origin IP addresses, which a site behind a WAF most wants hidden. Push capture repos only
-to private remotes. (`cf-sync init` puts this warning into every new capture repo's README.)
+expose origin IP addresses, which a site behind a WAF most wants hidden, and tunnel configurations
+name the internal service behind each published hostname. Push capture repos only to private
+remotes. (`cf-sync init` puts this warning into every new capture repo's README.)
 
 This tool repository, by contrast, contains no account data at all.
 
@@ -173,6 +175,15 @@ This tool repository, by contrast, contains no account data at all.
 - **Notifications are JSON lines, not HCL**, because the provider's alert-type list lags
   Cloudflare and one unknown value would fail `terraform validate` for the whole tree. Webhook
   destinations appear by id only: their URLs are bearer secrets.
+- **Tunnel configs keep cloudflared's key names.** cf-terraforming copies a tunnel's
+  configuration verbatim, so the keys inside `config` are the API's camelCase names
+  (`originRequest`, `originServerName`, `httpHostHeader`, `caPool`, `noTLSVerify`,
+  `warp-routing`), not the provider's snake_case attributes. `terraform validate` ignores unknown
+  keys inside a nested attribute, so the tree still validates and every ingress rule and origin
+  parameter is recorded faithfully; the file just could not be applied as-is. No tunnel secret or
+  run token is ever captured: the listing carries none, the token endpoint needs a write
+  permission, and `cf-sync` strips any `tunnel_secret` a generate emits. Deleted tunnels, routes
+  and virtual networks, which the API keeps listing, are filtered out.
 - **Wiring, not code.** Account-level capture records *which* Workers / D1 / R2 / KV / Queue
   resources exist and how they are wired to zones; never Worker source or bindings (each app's
   own repo and wrangler are the source of truth), D1 schema or data, R2 objects, KV values, or
@@ -196,6 +207,13 @@ This tool repository, by contrast, contains no account data at all.
   privacy) as HCL, plus `registrar.txt` dates. WHOIS contact data is never captured, and domains
   registered at another registrar are out of scope.
 - Account-level Bulk Redirects are not captured.
+- Tunnel capture has been checked against a real account with no tunnels and a simulated account
+  with several. Once your first tunnel exists, confirm it: `cf-sync account tunnels` reports
+  `tunnels NEW (1)` and, when the tunnel has a published application, `tunnel-configs NEW (1)`;
+  `grep -in 'secret\|token' terraform/account-tunnel*.tf` finds nothing; and
+  `terraform -chdir=terraform validate` still passes.
+- WARP Connector tunnels are not captured (a separate resource type); routes that point at them
+  are.
 
 ## Tested with
 

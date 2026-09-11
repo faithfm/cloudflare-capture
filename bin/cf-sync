@@ -10,7 +10,7 @@
 #   cf-sync zones               refresh the zone indexes only
 #   cf-sync init [account-id]   scaffold a new capture repo in the current directory
 # type (zone):    dns | rulesets | pagerules | settings | waf   (omitted = all types)
-# type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications
+# type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels
 # With no argument and no terminal (cron/automation), behaves like "all".
 # Dependencies (jq, terraform, cf-terraforming) are checked on start; cf-install
 # installs them.
@@ -54,14 +54,19 @@
 #                                  cron triggers, D1 databases, R2 buckets & custom
 #                                  domains, KV namespaces, Queues & consumers,
 #                                  Registrar settings (auto-renew/lock/privacy),
-#                                  WAF lists + list items + account IP Access Rules
+#                                  WAF lists + list items + account IP Access Rules,
+#                                  Cloudflare Tunnels (cloudflared) + each
+#                                  dashboard-configured tunnel's config (ingress
+#                                  rules, origin parameters), tunnel routes +
+#                                  virtual networks
 # An empty result (e.g. zone has no page rules) produces no file, and removes a
 # stale one — absence of the file means "zone has none of these".
 # Deliberately NOT captured — wiring, not code/data: Worker script code + bindings
 # (each app's own repo + wrangler are the source of truth), D1 schema/data, R2
 # object contents, KV values, queue messages, secret values (write-only at the
-# API), WHOIS contact PII, and registration state for domains registered outside
-# this account (out of scope: capture covers the account's own config).
+# API; tunnel secrets and run tokens included), WHOIS contact PII, and
+# registration state for domains registered outside this account (out of scope:
+# capture covers the account's own config).
 # Worker routes and R2 CORS/lifecycle rules are unsupported by
 # cf-terraforming v0.28 — add jq-to-HCL fallbacks if ever used. R2 artifacts
 # report "skipped" until R2 is enabled on the account (dashboard toggle).
@@ -74,6 +79,18 @@
 # List ITEMS are rendered by this script, not cf-terraforming: their endpoint
 # is cursor-paginated and 0.28.0 only follows page/total_pages (it would emit
 # the first page only, exit 0) and it writes each item's own id into list_id.
+# Tunnels (cloudflared): the tunnel, route and virtual-network listings include
+# soft-deleted objects unless asked not to; cf-terraforming doesn't ask and
+# drops the computed deleted_at, so a deleted object would stay in the file as
+# an ordinary block. Those artifacts keep only the ids listed as live (gen_live).
+# Tunnel configs are copied verbatim by cf-terraforming, so the keys INSIDE
+# `config` are cloudflared's camelCase names (originRequest, originServerName,
+# httpHostHeader, caPool, noTLSVerify, warp-routing), not the provider's
+# snake_case ones. terraform validate ignores unknown keys inside a nested
+# attribute, so the tree still validates and the file is a faithful record, but
+# not an applyable config. No tunnel secret or run token is ever captured: the
+# listing carries none, the token endpoint needs a write permission, and
+# drop_secrets strips any tunnel_secret a generate emits.
 # Account-level Bulk Redirects are NOT captured — verify none exist in this account.
 set -euo pipefail
 
@@ -210,6 +227,33 @@ progress() { # $1 = outfile, $2 = status text
   printf '[%02d/%02d] %-26s %-16s %s\n' "$ZIDX" "$ZTOTAL" "$ZNAME" "$label" "$2"
 }
 
+# Secret values are never captured, and drop_secrets makes that hold for
+# write-only secret attributes whatever cf-terraforming emits: every generate
+# passes through it before anything reaches disk. The one such attribute in a
+# captured type is the tunnel's tunnel_secret, which 0.28.0 never fills (the
+# tunnel listing carries no secret), but its code for the v4 provider's tunnel
+# resource did fetch each tunnel's run token into the HCL, and an upgrade must
+# not be able to bring that back. A drop is reported on stderr (it means the
+# generate started emitting one), and only then is the result re-formatted:
+# hclwrite aligns a block's "=" to its longest attribute name, so the block
+# would otherwise diff as whitespace. Output with nothing dropped is passed on
+# byte for byte as cf-terraforming wrote it.
+drop_secrets() {
+  local buf rc=0
+  buf=$(mktemp)
+  awk '/^[[:space:]]*tunnel_secret[[:space:]]*=/ { dropped = 1; next }
+       { print }
+       END { exit dropped ? 3 : 0 }' > "$buf" || rc=$?
+  case "$rc" in
+    0) cat "$buf" || rc=$? ;;
+    3) echo "cf-sync: dropped tunnel_secret from generated HCL (secrets are never captured)" >&2
+       rc=0
+       "$TFBIN" fmt - < "$buf" || rc=$? ;;
+  esac
+  rm -f "$buf"
+  return "$rc"
+}
+
 # run_gen <outtmp> <name-spec> <resource-type> [extra args...]
 # One cf-terraforming generate into <outtmp> (truncated per attempt), resource
 # names made diff-stable. <name-spec> is "<prefix>" (stabilize: payload-id keyed)
@@ -226,6 +270,7 @@ run_gen() {
     if cf-terraforming generate --resource-type "$rt" \
          --terraform-install-path terraform --terraform-binary-path "$TFBIN" \
          "$@" 2>"$err" \
+       | drop_secrets \
        | { if [ -n "$attr" ]; then rekey "$attr" "$prefix"; else stabilize "$prefix"; fi; } > "$tmp"; then
       rm -f "$err"
       return 0
@@ -303,6 +348,38 @@ gen_multi() {
   done <<<"$ids"
   commit_out "$out" "$tmp"
   rm -f "$part"
+  return 0
+}
+
+# gen_live <outfile> <name-spec> <resource-type> <live-id-lister-fn>
+# For account list types whose listing includes soft-deleted objects (tunnels,
+# tunnel routes, virtual networks: see the header note). One generate, then
+# only the blocks whose payload id <live-id-lister-fn> prints are kept
+# (filter_blocks, so the name-spec must be a stabilize prefix), and the kept
+# count must equal the live count: a truncated generate or a duplicate block
+# fails the artifact instead of reading as "removed". All-or-nothing like
+# gen_multi: any failure keeps the previous file.
+gen_live() {
+  local out="$1" spec="$2" rt="$3" lister="$4" ids tmp want got
+  if ! ids=$("$lister"); then
+    gen_failed "$out" "to list live resources"
+    return 0
+  fi
+  tmp=$(mktemp)
+  if ! run_gen "$tmp" "$spec" "$rt" --account "$ACCOUNT_ID"; then
+    gen_failed "$out" "after 3 attempts"
+    rm -f "$tmp"
+    return 0
+  fi
+  filter_blocks "$tmp" "$ids"
+  want=$(printf '%s\n' "$ids" | awk 'NF' | wc -l | tr -d ' ')
+  got=$(grep -c '^resource ' "$tmp" || true)
+  if [ "$got" != "$want" ]; then
+    gen_failed "$out" "($got generated of $want live — truncated listing or API change?)"
+    rm -f "$tmp"
+    return 0
+  fi
+  commit_out "$out" "$tmp"
   return 0
 }
 
@@ -390,6 +467,29 @@ queue_ids() {
        and ((.result_info.total_pages // 1) <= 1)
     then .result[] | (.queue_id // .id // error("queue without id"))
     else error("unexpected queue-list response") end'
+}
+
+# Tunnel-family listers. These endpoints include soft-deleted objects unless
+# asked not to, so they ask (is_deleted=false) and re-check deleted_at. They
+# report total_count, not total_pages; a full page may mean more pages, so it
+# fails the lister rather than passing for the complete set.
+live_objects() { # $1 = account-relative list path -> live objects, one JSON per line
+  api "/accounts/$ACCOUNT_ID/$1?is_deleted=false&per_page=1000" | jq -c '
+    if .success == true and (.result | type) == "array"
+       and ((.result | length) < (.result_info.per_page // 1000))
+    then .result[] | select(.deleted_at == null)
+    else error("unexpected or truncated listing") end'
+}
+live_tunnel_ids() { live_objects cfd_tunnel               | jq -r '.id // error("tunnel without id")'; }
+live_route_ids()  { live_objects teamnet/routes           | jq -r '.id // error("route without id")'; }
+live_vnet_ids()   { live_objects teamnet/virtual_networks | jq -r '.id // error("virtual network without id")'; }
+# Tunnels configured in the dashboard (config_src "cloudflare"): only they have
+# a configuration at the API; a locally-configured tunnel's ingress lives in
+# cloudflared's config file on the origin. (remote_config is deprecated.)
+remote_tunnel_ids() {
+  live_objects cfd_tunnel | jq -r '
+    if (.config_src // error("tunnel without config_src")) == "cloudflare"
+    then .id // error("tunnel without id") else empty end'
 }
 
 # render_list_items <account-id> <list-id> <list-kind>: JSON array of list
@@ -548,7 +648,7 @@ sync_workers_txt() { # 0 = workers.txt refreshed; 1 = FAILED (previous file kept
   fi
 }
 
-sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar | waf | notifications
+sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels
   local tsel="${1:-}" rc
   ZIDX=1 ZTOTAL=1 ZNAME="(account)"
   echo
@@ -608,10 +708,20 @@ sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv |
   if [ -z "$tsel" ] || [ "$tsel" = notifications ]; then
     sync_notifications_jsonl || true
   fi
+  if [ -z "$tsel" ] || [ "$tsel" = tunnels ]; then
+    # Cloudflare Tunnels (cloudflared). A config is per tunnel and holds its
+    # published applications: ingress rules and their origin parameters. It
+    # carries no payload id (cf-terraforming would key it by the account id),
+    # so it is rekeyed by tunnel_id.
+    gen_live  "terraform/account-tunnels.tf"        "tun_"            cloudflare_zero_trust_tunnel_cloudflared                 live_tunnel_ids
+    gen_multi "terraform/account-tunnel-configs.tf" "tcfg_@tunnel_id" cloudflare_zero_trust_tunnel_cloudflared_config          remote_tunnel_ids
+    gen_live  "terraform/account-tunnel-routes.tf"  "troute_"         cloudflare_zero_trust_tunnel_cloudflared_route           live_route_ids
+    gen_live  "terraform/account-tunnel-vnets.tf"   "vnet_"           cloudflare_zero_trust_tunnel_cloudflared_virtual_network live_vnet_ids
+  fi
 }
 
 is_zone_type()    { case "$1" in dns|rulesets|pagerules|settings|waf) ;; *) return 1 ;; esac; }
-is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar|waf|notifications) ;; *) return 1 ;; esac; }
+is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar|waf|notifications|tunnels) ;; *) return 1 ;; esac; }
 
 check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account | any
   local t="${1:-}" scope="${2:-any}"
@@ -620,9 +730,9 @@ check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account |
     zone)    is_zone_type "$t" && return 0
              echo "unknown type: $t (dns | rulesets | pagerules | settings | waf)" >&2 ;;
     account) is_account_type "$t" && return 0
-             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar | waf | notifications)" >&2 ;;
+             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels)" >&2 ;;
     *)       is_zone_type "$t" || is_account_type "$t" && return 0
-             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings | waf; account: workers | d1 | r2 | kv | queues | registrar | waf | notifications)" >&2 ;;
+             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings | waf; account: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels)" >&2 ;;
   esac
   exit 1
 }
@@ -779,6 +889,7 @@ type_menu() { # sets TYPE_SEL ("" = all types); Enter defaults to 0; number or n
   echo " 10 - queues"
   echo " 11 - registrar"
   echo " 12 - notifications"
+  echo " 13 - tunnels"
   echo
   echo "  0 - ALL TYPES"
   echo
@@ -798,7 +909,8 @@ type_menu() { # sets TYPE_SEL ("" = all types); Enter defaults to 0; number or n
       10|queues)        TYPE_SEL="queues" ;;
       11|registrar)     TYPE_SEL="registrar" ;;
       12|notifications) TYPE_SEL="notifications" ;;
-      *) echo "invalid selection: $choice — enter 0-12 or a type name" >&2; continue ;;
+      13|tunnels)       TYPE_SEL="tunnels" ;;
+      *) echo "invalid selection: $choice — enter 0-13 or a type name" >&2; continue ;;
     esac
     break
   done
@@ -813,7 +925,7 @@ menu() {
   max=$((i - 1))
   echo
   echo "  0 - ALL ZONES (+ account-level)"
-  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar / waf / notifications)"
+  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar / waf / notifications / tunnels)"
   echo
   while :; do
     read -rp "Sync what (number, zone name, or 'a')? [0]: " choice
