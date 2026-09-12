@@ -35,7 +35,7 @@ needs no sudo.
   installing it; `cf-install --update` skips the question. A checkout with your own changes in
   it is never touched (developers: `git pull` yourself).
 - **Uninstall**: `cf-install --uninstall` removes only the symlinks that point into this
-  checkout; a PATH line it added stays.
+  checkout; a PATH line it added stays, as does `cf-sync`'s list of recent capture repos.
 - **Linux**: Debian, Ubuntu and Fedora put `~/.local/bin` on `PATH` at your next login once it
   exists; the prompt just makes it immediate.
 - **System-wide**, on a single-user machine where you can sudo:
@@ -104,6 +104,14 @@ cf-install --uninstall           remove the symlinks (a PATH line it added stays
 
 Every command works from anywhere inside a capture repo (it finds `cf-sync.conf` by walking up,
 the way git finds `.git`), and `--help` works anywhere.
+
+Run `cf-sync` outside a capture repo, from a terminal, and it lists the capture repos it has run
+in recently: pick one by number (Enter takes the most recent) and the run carries on there with
+the same arguments, or type `init` to create a new capture repo in the current directory. Your
+shell stays where it was, so `cd` into the repo to review the diff. The list is kept in
+`~/.local/state/cloudflare-capture/recent-repos` (under `$XDG_STATE_HOME` if set) and holds only
+paths. Without a terminal, `cf-sync` outside a capture repo still just fails: automation never
+picks a repo.
 
 A sync takes roughly 20 seconds per zone. Progress is reported per artifact as
 `NEW / UPDATED / unchanged / REMOVED / none / skipped / FAILED`. A failed pull never overwrites

@@ -12,6 +12,9 @@
 # type (zone):    dns | rulesets | pagerules | settings | waf   (omitted = all types)
 # type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels
 # With no argument and no terminal (cron/automation), behaves like "all".
+# Outside a capture repo, a terminal run offers the capture repos used recently
+# (kept in ${XDG_STATE_HOME:-~/.local/state}/cloudflare-capture/recent-repos)
+# and carries on in the one picked, or offers init in the current directory.
 # Dependencies (jq, terraform, cf-terraforming) are checked on start; cf-install
 # installs them.
 #
@@ -103,6 +106,34 @@ find_capture_root() {
     [ "$d" = "/" ] && return 1
     d=$(dirname "$d")
   done
+}
+
+# Capture repos cf-sync has run in, most recent first, for the menu it shows
+# outside one. Per-user state (the XDG spec's home for "recently used files"),
+# not config: one path per line, at most 10, nothing but paths.
+RECENT_REPOS="${XDG_STATE_HOME:-$HOME/.local/state}/cloudflare-capture/recent-repos"
+
+# remember_repo <path>: move <path> to the top of the list. Best-effort and
+# silent: call it with || true, since a failure to record must never fail a sync.
+remember_repo() {
+  local tmp
+  mkdir -p "${RECENT_REPOS%/*}" 2>/dev/null || return 0
+  tmp=$(mktemp "$RECENT_REPOS.XXXXXX" 2>/dev/null) || return 0
+  { printf '%s\n' "$1"; [ ! -f "$RECENT_REPOS" ] || cat "$RECENT_REPOS" 2>/dev/null; } \
+    | awk 'NF && !seen[$0]++ && ++n <= 10' > "$tmp" \
+    && mv -f "$tmp" "$RECENT_REPOS" 2>/dev/null
+  rm -f "$tmp"
+}
+
+# recent_repos: the remembered capture repos that still have a cf-sync.conf.
+# A missing one is skipped, not forgotten, so a repo on an unmounted volume
+# comes back; it drops off only when the 10-entry cap pushes it out.
+recent_repos() {
+  local d
+  [ -f "$RECENT_REPOS" ] || return 0
+  while IFS= read -r d; do
+    if [ -n "$d" ] && [ -f "$d/cf-sync.conf" ]; then printf '%s\n' "$d"; fi
+  done < "$RECENT_REPOS"
 }
 
 # The checkout this command is symlinked from (cf-install symlinks bin/* into
@@ -1012,8 +1043,47 @@ init_repo() {
   echo "Capture repo ready in $PWD. Next: cf-sync (interactive) or cf-sync all."
 }
 
+# tilde <path>: for display, $HOME shown as a literal ~
+# shellcheck disable=SC2088
+tilde() { case "$1" in "$HOME"/*) printf '~/%s\n' "${1#"$HOME"/}" ;; *) printf '%s\n' "$1" ;; esac; }
+
+# Outside a capture repo, on a terminal: offer the capture repos used recently
+# (Enter = the most recent) or init in this directory. Sets CAPTURE_ROOT, and
+# the run carries on there with its arguments; the user's shell stays put (a
+# script cannot move it).
+repo_menu() {
+  local repos d n=0 choice ask="Enter 'init' or 'q': "
+  repos=$(recent_repos)
+  echo "Not inside a capture repo: no cf-sync.conf in this directory or any parent."
+  if [ -n "$repos" ]; then
+    echo "Capture repos used recently:"
+    while IFS= read -r d; do
+      n=$((n + 1))
+      printf '%3d - %s\n' "$n" "$(tilde "$d")"
+    done <<<"$repos"
+    ask="Use which (1-$n, 'init' or 'q')? [1]: "
+  fi
+  echo
+  echo "  init - create a new capture repo in this directory ($(tilde "$PWD"))"
+  echo "  q    - quit"
+  echo
+  while :; do
+    read -rp "$ask" choice
+    [ "$n" -gt 0 ] && choice=${choice:-1}
+    case "$choice" in
+      init) init_repo ""; exit 0 ;;
+      q)    exit 1 ;;
+    esac
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ]; then
+      CAPTURE_ROOT=$(sed -n "${choice}p" <<<"$repos")
+      return 0
+    fi
+    echo "invalid selection: $choice" >&2
+  done
+}
+
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-  sed -n '2,19p' "$0"
+  sed -n '2,22p' "$0"
   exit 0
 fi
 
@@ -1026,11 +1096,16 @@ fi
 
 # Mandatory per-repo config — no defaults: refusing to run beats capturing the
 # wrong account's config into the wrong repo. See the Config note in the header.
-CAPTURE_ROOT=$(find_capture_root) || {
-  echo "Not inside a capture repo: no cf-sync.conf in this directory or any parent." >&2
-  echo "Run 'cf-sync init' in a new, empty directory to create one." >&2
-  exit 1
-}
+# Outside a capture repo, only a person at a terminal picks one: automation
+# never guesses, so it still fails here.
+if ! CAPTURE_ROOT=$(find_capture_root); then
+  if [ ! -t 0 ]; then
+    echo "Not inside a capture repo: no cf-sync.conf in this directory or any parent." >&2
+    echo "Run 'cf-sync init' in a new, empty directory to create one." >&2
+    exit 1
+  fi
+  repo_menu
+fi
 cd "$CAPTURE_ROOT"
 # shellcheck disable=SC1091
 . ./cf-sync.conf
@@ -1039,6 +1114,7 @@ if ! [[ "${ACCOUNT_ID:-}" =~ ^[0-9a-f]{32}$ ]]; then
   exit 1
 fi
 KEYCHAIN_SERVICE="cloudflare-api-token-$ACCOUNT_ID"
+remember_repo "$CAPTURE_ROOT" || true
 
 check_deps
 TFBIN=$(command -v terraform)
