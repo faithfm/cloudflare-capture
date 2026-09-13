@@ -8,7 +8,8 @@ clean, per-record `git diff`.
 Nothing here runs `terraform apply`, and there is no Terraform state. HCL is simply the storage
 format: it covers the full configuration (DNS records including the proxied flag, zone settings,
 rulesets, WAF, tunnels, account-level wiring), and `terraform validate` can check the whole tree.
-Notification policies, which HCL cannot hold faithfully, are captured as plain JSON.
+Notification policies and Cloudflare Access, which HCL cannot hold faithfully, are captured
+as plain JSON.
 
 One installed copy of the tool serves any number of accounts. Each account gets its own
 **capture repo**, which holds only data: `cf-sync.conf` (one setting, the account id) plus what
@@ -90,7 +91,7 @@ cf-sync zones                    refresh the zone indexes only
 cf-sync init [account-id]        scaffold a new capture repo in the current directory
 
 type (zone)    = dns | rulesets | pagerules | settings | waf
-type (account) = workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels
+type (account) = workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access
 ```
 
 ```text
@@ -146,6 +147,7 @@ git commit -am "describe the change"
 | `terraform/waf-<zone>.tf` | WAF-family settings held outside the rulesets API: Bot Fight Mode / Super Bot Fight Mode, leaked-credential detection (+ its custom detection rules), IP Access Rules, Zone Lockdowns, User Agent Blocking (always present; the rule kinds appear only when the zone has some) |
 | `terraform/account-*.tf` | Account-level config: Workers custom domains & cron triggers, D1 databases, R2 buckets & custom domains, KV namespaces, Queues & consumers, Registrar settings, WAF lists + list items + account-level IP Access Rules (absent = account has none) |
 | `terraform/account-tunnel*.tf` | Cloudflare Tunnels: each tunnel's name and whether it is configured in the dashboard or locally (`account-tunnels.tf`); each dashboard-configured tunnel's published applications, its ingress rules with their origin parameters (`account-tunnel-configs.tf`); private-network routes and virtual networks (`account-tunnel-routes.tf`, `account-tunnel-vnets.tf`). Never tunnel secrets or run tokens (absent = account has none) |
+| `access-*.json` | Cloudflare Access (Zero Trust): the organisation and its settings (`access-org.json`), identity providers, groups, reusable policies, applications with their attached policies, service tokens (client id, secret version and expiry; never the secret) and custom block pages; secrets masked (absent = account has none) |
 
 An empty result produces no file, and removes a stale one: absence means "none of these".
 
@@ -153,10 +155,12 @@ An empty result produces no file, and removes a stale one: absence means "none o
 
 A capture repo is a detailed map of your infrastructure, and it contains personal data.
 `audit-log.jsonl` records the email address of everyone who has changed the account, third
-parties included, and `notifications.json` holds alert recipients' addresses. The DNS files
-expose origin IP addresses, which a site behind a WAF most wants hidden, and tunnel configurations
-name the internal service behind each published hostname. Push capture repos only to private
-remotes. (`cf-sync init` puts this warning into every new capture repo's README.)
+parties included, `notifications.json` holds alert recipients' addresses, and
+`access-groups.json` lists everyone Cloudflare Access lets in. The DNS files expose origin IP
+addresses, which a site behind a WAF most wants hidden, tunnel configurations name the internal
+service behind each published hostname, and Access policies name the IP ranges that skip the
+login. Push capture repos only to private remotes. (`cf-sync init` puts this warning into every
+new capture repo's README.)
 
 This tool repository, by contrast, contains no account data at all.
 
@@ -201,6 +205,12 @@ This tool repository, by contrast, contains no account data at all.
   run token is captured whole: the listing carries no secret, the token endpoint needs a write
   permission, and `cf-sync` masks any `tunnel_secret` a generate emits. Deleted tunnels, routes
   and virtual networks, which the API keeps listing, are filtered out.
+- **Access is JSON.** cf-terraforming's HCL for Cloudflare Access fails `terraform validate` for
+  identity providers and applications (among other things, it writes each attached policy with
+  both its id and its rules), names every custom page alike, and cannot hold a service token's
+  client id or expiry; so all seven Access files are plain JSON, straight from the API. An
+  application lists its reusable policies by reference (id, name, precedence); their rules are in
+  `access-policies.json`, so a policy change shows up once.
 - **Wiring, not code.** Account-level capture records *which* Workers / D1 / R2 / KV / Queue
   resources exist and how they are wired to zones; never Worker source or bindings (each app's
   own repo and wrangler are the source of truth), D1 schema or data, R2 objects, KV values, or
@@ -232,6 +242,17 @@ This tool repository, by contrast, contains no account data at all.
   `terraform -chdir=terraform validate` still passes.
 - WARP Connector tunnels are not captured (a separate resource type); routes that point at them
   are.
+- Access capture has been checked against a real account with a Zero Trust organisation and the
+  default One-time PIN login, and a simulated account with the rest. On first use, check two
+  assumptions: an application's reusable policies appear as `{id, name, precedence}` (if the API
+  stops flagging them reusable, they are copied in full instead); and once an OAuth identity
+  provider such as Auth0 exists, `access-idps.json` shows its `client_secret` as a masked tail
+  (`…Qk7f`) if the API returns it, so a rotation will show, or no `client_secret` at all if the
+  API withholds it. An account that has never set up Zero Trust is untested; its Access endpoints
+  may answer with errors, which report FAILED.
+- Not captured from Access: key rotation, tags, mTLS certificates, short-lived SSH certificates,
+  infrastructure targets, bookmarks, users and seats, and legacy zone-level Access; nor Gateway
+  and device settings, which are separate products.
 
 ## Tested with
 

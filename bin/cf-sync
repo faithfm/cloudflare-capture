@@ -10,7 +10,7 @@
 #   cf-sync zones               refresh the zone indexes only
 #   cf-sync init [account-id]   scaffold a new capture repo in the current directory
 # type (zone):    dns | rulesets | pagerules | settings | waf   (omitted = all types)
-# type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels
+# type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access
 # With no argument and no terminal (cron/automation), behaves like "all".
 # Outside a capture repo, a terminal run offers the capture repos used recently
 # (kept in ${XDG_STATE_HOME:-~/.local/state}/cloudflare-capture/recent-repos)
@@ -40,6 +40,9 @@
 #   workers.txt                    Worker inventory: <script-name> <created-date>
 #   registrar.txt                  Cloudflare-registered domains: <name> <registered> <expires>
 #   notifications.json             notification policies (JSON, see below)
+#   access-*.json                  Cloudflare Access (Zero Trust): organisation,
+#                                  identity providers, groups, policies,
+#                                  applications, service tokens, custom pages (JSON)
 #   .cf-capture-version            cloudflare-capture version that made the last run
 #   terraform/dns-<zone>.tf        DNS records
 #   terraform/settings-<zone>.tf   zone settings (incl. SSL/TLS)
@@ -103,6 +106,15 @@
 # not an applyable config. No tunnel secret or run token is captured whole: the
 # listing carries no secret, the token endpoint needs a write permission, and
 # mask_secrets masks any tunnel_secret a generate emits.
+# Access (Zero Trust) is captured as JSON, not HCL: cf-terraforming 0.28.0's
+# output fails terraform validate for identity providers (the One-time PIN
+# provider's empty name is dropped, and scim_config is rejected on it) and for
+# applications (each attached policy carries both its id and its rules), it
+# names every custom page after the account id, and it cannot hold a service
+# token's client_id or expiry. An application lists its reusable policies by
+# reference (id, name, precedence); their rules are in access-policies.json.
+# Service tokens keep id, name, client_id, client_secret_version, duration and
+# expires_at: never the secret, which the API shows only at creation.
 # Account-level Bulk Redirects are NOT captured — verify none exist in this account.
 set -euo pipefail
 
@@ -744,7 +756,56 @@ sync_workers_txt() { # 0 = workers.txt refreshed; 1 = FAILED (previous file kept
   fi
 }
 
-sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels
+# Cloudflare Access (Zero Trust), all JSON (see the header's Access note). The
+# organisation is a singleton; everything else is a listing in id order.
+# Timestamps are dropped, and so is a policy's app_count, which follows from
+# the applications that list it. An attached policy the API flags reusable is
+# reduced to a reference; any other is kept whole.
+sync_access() {
+  local a="/accounts/$ACCOUNT_ID/access"
+  capture_json access-org.json      "$a/organizations"      'single | del(.created_at, .updated_at)'
+  capture_json access-idps.json     "$a/identity_providers" 'listing | map(del(.created_at, .updated_at)) | sort_by(.id)'
+  capture_json access-groups.json   "$a/groups"             'listing | map(del(.created_at, .updated_at)) | sort_by(.id)'
+  capture_json access-policies.json "$a/policies"           'listing | map(del(.created_at, .updated_at, .app_count)) | sort_by(.id)'
+  capture_json access-apps.json     "$a/apps"               '
+    listing | map(del(.created_at, .updated_at)
+                  | if (.policies | type) == "array"
+                    then .policies |= map(if .reusable == true then {id, name, precedence}
+                                          else del(.created_at, .updated_at, .app_count) end)
+                    else . end)
+    | sort_by(.id)'
+  capture_json access-service-tokens.json "$a/service_tokens" '
+    listing | map({id, name, client_id, client_secret_version, duration, expires_at}
+                  | with_entries(select(.value != null)))
+    | sort_by(.id)'
+  sync_access_pages
+}
+
+# Custom pages: the listing leaves out the HTML, so each page is fetched by
+# uid. All-or-nothing: any failed fetch keeps the previous file.
+sync_access_pages() {
+  local out=access-custom-pages.json a="/accounts/$ACCOUNT_ID/access/custom_pages" resp uids uid pages
+  if ! resp=$(api "$a") \
+     || ! uids=$(jq -r --arg mask "$MASK" "$JQ_PRELUDE listing[] | .uid // error(\"page without uid\")" <<<"$resp"); then
+    gen_failed "$out" "to list custom pages"
+    return 0
+  fi
+  pages=$(mktemp)
+  while read -r uid; do
+    [ -n "$uid" ] || continue
+    if ! resp=$(api "$a/$uid" </dev/null) \
+       || ! jq -c --arg mask "$MASK" "$JQ_PRELUDE single" <<<"$resp" >> "$pages"; then
+      gen_failed "$out" "to fetch custom page $uid"
+      rm -f "$pages"
+      return 0
+    fi
+  done <<<"$uids"
+  json_out "$out" "(unexpected custom page)" 'map({uid, name, type, custom_html}) | sort_by(.uid)' \
+    < <(jq -s . "$pages")
+  rm -f "$pages"
+}
+
+sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access
   local tsel="${1:-}" rc
   ZIDX=1 ZTOTAL=1 ZNAME="(account)"
   echo
@@ -814,10 +875,13 @@ sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv |
     gen_live  "terraform/account-tunnel-routes.tf"  "troute_"         cloudflare_zero_trust_tunnel_cloudflared_route           live_route_ids
     gen_live  "terraform/account-tunnel-vnets.tf"   "vnet_"           cloudflare_zero_trust_tunnel_cloudflared_virtual_network live_vnet_ids
   fi
+  if [ -z "$tsel" ] || [ "$tsel" = access ]; then
+    sync_access
+  fi
 }
 
 is_zone_type()    { case "$1" in dns|rulesets|pagerules|settings|waf) ;; *) return 1 ;; esac; }
-is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar|waf|notifications|tunnels) ;; *) return 1 ;; esac; }
+is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar|waf|notifications|tunnels|access) ;; *) return 1 ;; esac; }
 
 check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account | any
   local t="${1:-}" scope="${2:-any}"
@@ -826,9 +890,9 @@ check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account |
     zone)    is_zone_type "$t" && return 0
              echo "unknown type: $t (dns | rulesets | pagerules | settings | waf)" >&2 ;;
     account) is_account_type "$t" && return 0
-             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels)" >&2 ;;
+             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access)" >&2 ;;
     *)       is_zone_type "$t" || is_account_type "$t" && return 0
-             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings | waf; account: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels)" >&2 ;;
+             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings | waf; account: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access)" >&2 ;;
   esac
   exit 1
 }
@@ -986,6 +1050,7 @@ type_menu() { # sets TYPE_SEL ("" = all types); Enter defaults to 0; number or n
   echo " 11 - registrar"
   echo " 12 - notifications"
   echo " 13 - tunnels"
+  echo " 14 - access"
   echo
   echo "  0 - ALL TYPES"
   echo
@@ -1006,7 +1071,8 @@ type_menu() { # sets TYPE_SEL ("" = all types); Enter defaults to 0; number or n
       11|registrar)     TYPE_SEL="registrar" ;;
       12|notifications) TYPE_SEL="notifications" ;;
       13|tunnels)       TYPE_SEL="tunnels" ;;
-      *) echo "invalid selection: $choice — enter 0-13 or a type name" >&2; continue ;;
+      14|access)        TYPE_SEL="access" ;;
+      *) echo "invalid selection: $choice — enter 0-14 or a type name" >&2; continue ;;
     esac
     break
   done
@@ -1021,7 +1087,7 @@ menu() {
   max=$((i - 1))
   echo
   echo "  0 - ALL ZONES (+ account-level)"
-  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar / waf / notifications / tunnels)"
+  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar / waf / notifications / tunnels / access)"
   echo
   while :; do
     read -rp "Sync what (number, zone name, or 'a')? [0]: " choice
