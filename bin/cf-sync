@@ -39,7 +39,7 @@
 #                                  paused, assigned nameservers (tab-separated)
 #   workers.txt                    Worker inventory: <script-name> <created-date>
 #   registrar.txt                  Cloudflare-registered domains: <name> <registered> <expires>
-#   notifications.jsonl            notification policies, one JSON object per line
+#   notifications.json             notification policies (JSON, see below)
 #   .cf-capture-version            cloudflare-capture version that made the last run
 #   terraform/dns-<zone>.tf        DNS records
 #   terraform/settings-<zone>.tf   zone settings (incl. SSL/TLS)
@@ -66,19 +66,28 @@
 # stale one — absence of the file means "zone has none of these".
 # Deliberately NOT captured — wiring, not code/data: Worker script code + bindings
 # (each app's own repo + wrangler are the source of truth), D1 schema/data, R2
-# object contents, KV values, queue messages, secret values (write-only at the
-# API; tunnel secrets and run tokens included), WHOIS contact PII, and
-# registration state for domains registered outside this account (out of scope:
-# capture covers the account's own config).
+# object contents, KV values, queue messages, secret values in full (most are
+# write-only at the API; one that is returned is masked, see Secrets below),
+# WHOIS contact PII, and registration state for domains registered outside this
+# account (out of scope: capture covers the account's own config).
 # Worker routes and R2 CORS/lifecycle rules are unsupported by
 # cf-terraforming v0.28 — add jq-to-HCL fallbacks if ever used. R2 artifacts
 # report "skipped" until R2 is enabled on the account (dashboard toggle).
-# Notification policies are JSON lines, not HCL: the provider's alert_type enum
-# lags Cloudflare (5.24.0 still rejects the auto-created billing_budget_alert)
-# and one unknown value would fail `terraform validate` for the whole tree.
+# Notification policies are JSON, not HCL: the provider's alert_type enum lags
+# Cloudflare (5.24.0 still rejects the auto-created billing_budget_alert) and
+# one unknown value would fail `terraform validate` for the whole tree.
 # Webhook/PagerDuty destinations appear by id only (their URLs are bearer
 # secrets). Legacy rate limits and firewall rules have no API any more
 # (410 Gone / migrated to rulesets).
+# JSON artifacts are state, so they are pretty-printed: keys sorted, objects
+# ordered by id, timestamps dropped, and a change diffs per field. JSON lines
+# is left to the audit log (cf-audit-archive), an append-only event stream.
+# Secrets are masked, never captured whole and never dropped, so a rotation
+# still shows in the diff: a value longer than 12 characters is kept as "…"
+# plus its last 4 characters, a shorter one as "…" plus its last 2, a password
+# as no more than its last 2, and no mask shows more than half a value. JSON
+# artifacts mask every client_secret, secret, token and password key
+# (JQ_PRELUDE); generated HCL masks tunnel_secret (mask_secrets).
 # List ITEMS are rendered by this script, not cf-terraforming: their endpoint
 # is cursor-paginated and 0.28.0 only follows page/total_pages (it would emit
 # the first page only, exit 0) and it writes each item's own id into list_id.
@@ -91,9 +100,9 @@
 # httpHostHeader, caPool, noTLSVerify, warp-routing), not the provider's
 # snake_case ones. terraform validate ignores unknown keys inside a nested
 # attribute, so the tree still validates and the file is a faithful record, but
-# not an applyable config. No tunnel secret or run token is ever captured: the
-# listing carries none, the token endpoint needs a write permission, and
-# drop_secrets strips any tunnel_secret a generate emits.
+# not an applyable config. No tunnel secret or run token is captured whole: the
+# listing carries no secret, the token endpoint needs a write permission, and
+# mask_secrets masks any tunnel_secret a generate emits.
 # Account-level Bulk Redirects are NOT captured — verify none exist in this account.
 set -euo pipefail
 
@@ -250,39 +259,66 @@ rekey() { # $1 = key attribute inside the block, $2 = resource-name prefix
 
 progress() { # $1 = outfile, $2 = status text
   local base="${1##*/}" label
-  base="${base%.tf}"
-  case "$base" in
-    account-*) label="${base#account-}" ;;   # account-workers-crons -> workers-crons
-    *)         label="${base%%-*}" ;;        # dns-example.com -> dns
+  case "$1" in
+    terraform/account-*) base="${base%.tf}"; label="${base#account-}" ;;  # account-workers-crons.tf -> workers-crons
+    terraform/*)         label="${base%%-*}" ;;                          # dns-example.com.tf -> dns
+    *)                   label="${base%.*}" ;;                           # notifications.json -> notifications
   esac
-  printf '[%02d/%02d] %-26s %-16s %s\n' "$ZIDX" "$ZTOTAL" "$ZNAME" "$label" "$2"
+  printf '[%02d/%02d] %-26s %-22s %s\n' "$ZIDX" "$ZTOTAL" "$ZNAME" "$label" "$2"
 }
 
-# Secret values are never captured, and drop_secrets makes that hold for
-# write-only secret attributes whatever cf-terraforming emits: every generate
-# passes through it before anything reaches disk. The one such attribute in a
-# captured type is the tunnel's tunnel_secret, which 0.28.0 never fills (the
-# tunnel listing carries no secret), but its code for the v4 provider's tunnel
-# resource did fetch each tunnel's run token into the HCL, and an upgrade must
-# not be able to bring that back. A drop is reported on stderr (it means the
-# generate started emitting one), and only then is the result re-formatted:
-# hclwrite aligns a block's "=" to its longest attribute name, so the block
-# would otherwise diff as whitespace. Output with nothing dropped is passed on
-# byte for byte as cf-terraforming wrote it.
-drop_secrets() {
-  local buf rc=0
-  buf=$(mktemp)
-  awk '/^[[:space:]]*tunnel_secret[[:space:]]*=/ { dropped = 1; next }
-       { print }
-       END { exit dropped ? 3 : 0 }' > "$buf" || rc=$?
-  case "$rc" in
-    0) cat "$buf" || rc=$? ;;
-    3) echo "cf-sync: dropped tunnel_secret from generated HCL (secrets are never captured)" >&2
-       rc=0
-       "$TFBIN" fmt - < "$buf" || rc=$? ;;
-  esac
-  rm -f "$buf"
-  return "$rc"
+# MASK leads every masked secret, in JSON (JQ_PRELUDE) and in generated HCL
+# (mask_secrets); the rule is in the header's Secrets note.
+MASK='…'
+
+# jq definitions every JSON artifact is built with (jq --arg mask "$MASK").
+# listing and single assert the API envelope, so a failed or drifted response
+# fails the artifact instead of reading as "none"; listing also refuses a
+# result that spans pages. mask_secrets masks every client_secret, secret,
+# token and password string, at any depth. ($mask and $n are jq variables.)
+# shellcheck disable=SC2016
+JQ_PRELUDE='
+  def listing: if .success == true and (.result | type) == "array"
+                  and ((.result_info.total_pages // 1) <= 1)
+               then .result else error("unexpected or truncated listing") end;
+  def single:  if .success == true and (.result | type) == "object"
+               then .result else error("unexpected response") end;
+  def tail($n): if type == "string" and length > 0
+                then $mask + .[length - ([$n, (length / 2 | floor)] | min):] else . end;
+  def mask_secrets: walk(if type == "object" then with_entries(
+      if (.key | IN("client_secret", "secret", "token"))
+      then .value |= tail(if type == "string" and length > 12 then 4 else 2 end)
+      elif .key == "password" then .value |= tail(2)
+      else . end) else . end);
+'
+
+# Generated HCL passes through mask_secrets before anything reaches disk, so no
+# secret is written whole whatever cf-terraforming emits. The one secret
+# attribute in a captured HCL type is the tunnel's tunnel_secret, which 0.28.0
+# never fills (the tunnel listing carries no secret), but its code for the v4
+# provider's tunnel resource did fetch each tunnel's run token into the HCL,
+# and an upgrade must not be able to bring that back whole. A plain quoted
+# value keeps its masked tail; any other form is masked entirely. A mask is
+# reported on stderr (it means the generate started emitting a secret). The
+# attribute name stays, so hclwrite's "=" alignment stands; output with nothing
+# masked is passed on byte for byte.
+mask_secrets() {
+  awk -v mask="$MASK" '
+    function tail(s,   n) {  # the JQ_PRELUDE rule
+      if (s == "") return s
+      n = length(s) > 12 ? 4 : 2
+      if (n > int(length(s) / 2)) n = int(length(s) / 2)
+      return mask substr(s, length(s) - n + 1)
+    }
+    /^[[:space:]]*tunnel_secret[[:space:]]*=/ {
+      eq = index($0, "="); v = substr($0, eq + 1); sub(/^[[:space:]]+/, "", v)
+      if (v ~ /^"[^"\\]*"$/) v = tail(substr(v, 2, length(v) - 2)); else v = mask
+      print substr($0, 1, eq) " \"" v "\""
+      masked = 1
+      next
+    }
+    { print }
+    END { if (masked) print "cf-sync: masked tunnel_secret in generated HCL (a secret is never captured whole)" > "/dev/stderr" }'
 }
 
 # run_gen <outtmp> <name-spec> <resource-type> [extra args...]
@@ -301,7 +337,7 @@ run_gen() {
     if cf-terraforming generate --resource-type "$rt" \
          --terraform-install-path terraform --terraform-binary-path "$TFBIN" \
          "$@" 2>"$err" \
-       | drop_secrets \
+       | mask_secrets \
        | { if [ -n "$attr" ]; then rekey "$attr" "$prefix"; else stabilize "$prefix"; fi; } > "$tmp"; then
       rm -f "$err"
       return 0
@@ -319,7 +355,10 @@ run_gen() {
 commit_out() {
   local out="$1" tmp="$2" n status
   if [ -s "$tmp" ]; then
-    n=$(grep -c '^resource ' "$tmp" || true)
+    case "$out" in
+      *.json) n=$(jq 'if type == "array" then length else 1 end' "$tmp") ;;
+      *)      n=$(grep -c '^resource ' "$tmp" || true) ;;
+    esac
     if [ -f "$out" ] && cmp -s "$tmp" "$out"; then status="unchanged ($n)"
     elif [ -f "$out" ]; then status="UPDATED ($n)"
     else status="NEW ($n)"; fi
@@ -411,6 +450,37 @@ gen_live() {
     return 0
   fi
   commit_out "$out" "$tmp"
+  return 0
+}
+
+# json_out <outfile> <failure-detail> <jq-filter>: one JSON artifact from the
+# API response on stdin (see the header's JSON note). The filter runs with
+# JQ_PRELUDE loaded and must produce one value, an array for a listing or an
+# object for a singleton; it is masked, key-sorted and pretty-printed. An empty
+# array means "none" (commit_out removes the file). A jq error, or no output at
+# all (as from an empty response), is a failure that keeps the previous file.
+json_out() {
+  local out="$1" what="$2" filter="$3" tmp
+  tmp=$(mktemp)
+  if jq -S --arg mask "$MASK" "$JQ_PRELUDE ($filter) | mask_secrets" > "$tmp" && [ -s "$tmp" ]; then
+    if [ "$(jq 'if type == "array" then length else 1 end' "$tmp")" = 0 ]; then : > "$tmp"; fi
+    commit_out "$out" "$tmp"
+  else
+    rm -f "$tmp"
+    gen_failed "$out" "$what"
+  fi
+  return 0
+}
+
+# capture_json <outfile> <api-path> <jq-filter>: fetch one response, then
+# json_out. A failed fetch keeps the previous file, like any other failure.
+capture_json() {
+  local resp what="${2#/accounts/"$ACCOUNT_ID"/}"
+  if resp=$(api "$2"); then
+    json_out "$1" "(unexpected response from $what)" "$3" <<<"$resp"
+  else
+    gen_failed "$1" "to fetch $what"
+  fi
   return 0
 }
 
@@ -635,25 +705,20 @@ sync_registrar_txt() { # 0 = registrar.txt refreshed; 1 = FAILED (previous file 
   fi
 }
 
-# Notification policies -> notifications.jsonl: one policy per line, keys
-# sorted recursively, ordered by id, timestamps dropped, destinations reduced
-# to ids (email addresses are ids and are kept: attribution, as in the audit
-# log). Never-clobber: replaced only after a fully successful pull.
-sync_notifications_jsonl() { # 0 = refreshed; 1 = FAILED (previous file kept)
-  local tmp
-  tmp=$(mktemp)
-  if api "/accounts/$ACCOUNT_ID/alerting/v3/policies" | jq -S -c '
-       if .success == true and (.result | type) == "array"
-          and ((.result_info.total_pages // 1) <= 1)
-       then .result | sort_by(.id)[] | del(.created, .modified)
-            | .mechanisms |= ((. // {}) | with_entries(.value |= map({id})))
-       else error("unexpected policy-list response") end' > "$tmp"; then
-    mv "$tmp" notifications.jsonl
-    echo "notification policies: $(wc -l < notifications.jsonl | tr -d ' ')"
-  else
-    rm -f "$tmp"
-    gen_failed notifications.jsonl "to list notification policies"
-    return 1
+# Notification policies -> notifications.json, ordered by id, timestamps
+# dropped, destinations reduced to ids (email addresses are ids and are kept:
+# attribution, as in the audit log). Until 1.3.0 this was notifications.jsonl,
+# one policy per line; that file goes once the new one is captured (or found
+# to be none), so no capture repo keeps a stale copy.
+sync_notifications() {
+  local before=$FAILURES
+  capture_json notifications.json "/accounts/$ACCOUNT_ID/alerting/v3/policies" '
+    listing | map(del(.created, .modified)
+                  | .mechanisms |= ((. // {}) | with_entries(.value |= map({id}))))
+    | sort_by(.id)'
+  if [ "$FAILURES" = "$before" ] && [ -f notifications.jsonl ]; then
+    rm -f notifications.jsonl
+    echo "notifications.jsonl replaced by notifications.json (cloudflare-capture 1.3.0)"
   fi
 }
 
@@ -737,7 +802,7 @@ sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv |
     gen_to    "terraform/account-waf-access-rules.tf" "aar_"       cloudflare_access_rule --account "$ACCOUNT_ID"
   fi
   if [ -z "$tsel" ] || [ "$tsel" = notifications ]; then
-    sync_notifications_jsonl || true
+    sync_notifications
   fi
   if [ -z "$tsel" ] || [ "$tsel" = tunnels ]; then
     # Cloudflare Tunnels (cloudflared). A config is per tunnel and holds its

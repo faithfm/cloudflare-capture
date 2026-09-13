@@ -8,6 +8,7 @@ clean, per-record `git diff`.
 Nothing here runs `terraform apply`, and there is no Terraform state. HCL is simply the storage
 format: it covers the full configuration (DNS records including the proxied flag, zone settings,
 rulesets, WAF, tunnels, account-level wiring), and `terraform validate` can check the whole tree.
+Notification policies, which HCL cannot hold faithfully, are captured as plain JSON.
 
 One installed copy of the tool serves any number of accounts. Each account gets its own
 **capture repo**, which holds only data: `cf-sync.conf` (one setting, the account id) plus what
@@ -137,7 +138,7 @@ git commit -am "describe the change"
 | `zones-meta.tsv` | Per-zone metadata: plan, status, type, paused, assigned nameservers |
 | `workers.txt` | Worker inventory: script name + created date |
 | `registrar.txt` | Cloudflare-registered domains: name + registered + expires |
-| `notifications.jsonl` | Notification policies, one JSON object per line (destinations by id; webhook URLs never captured) |
+| `notifications.json` | Notification policies (destinations by id; webhook URLs never captured) |
 | `terraform/dns-<zone>.tf` | DNS records, including the proxied (orange-cloud) flag |
 | `terraform/settings-<zone>.tf` | Zone settings, including SSL/TLS |
 | `terraform/rulesets-<zone>.tf` | Redirect / transform / WAF rules (absent = zone has none) |
@@ -152,7 +153,7 @@ An empty result produces no file, and removes a stale one: absence means "none o
 
 A capture repo is a detailed map of your infrastructure, and it contains personal data.
 `audit-log.jsonl` records the email address of everyone who has changed the account, third
-parties included, and `notifications.jsonl` holds alert recipients' addresses. The DNS files
+parties included, and `notifications.json` holds alert recipients' addresses. The DNS files
 expose origin IP addresses, which a site behind a WAF most wants hidden, and tunnel configurations
 name the internal service behind each published hostname. Push capture repos only to private
 remotes. (`cf-sync init` puts this warning into every new capture repo's README.)
@@ -180,22 +181,30 @@ This tool repository, by contrast, contains no account data at all.
   rulesets are Cloudflare's config and are not captured; only your deployment of them is.
   [docs/cloudflare-waf-notes.md](docs/cloudflare-waf-notes.md) is a WAF rollout recipe that
   uses the capture at every step.
-- **Notifications are JSON lines, not HCL**, because the provider's alert-type list lags
-  Cloudflare and one unknown value would fail `terraform validate` for the whole tree. Webhook
-  destinations appear by id only: their URLs are bearer secrets.
+- **JSON where HCL doesn't fit.** Notification policies are JSON, not HCL, because the
+  provider's alert-type list lags Cloudflare and one unknown value would fail `terraform
+  validate` for the whole tree. Webhook destinations appear by id only: their URLs are bearer
+  secrets. JSON captures are state, so they are pretty-printed, with keys sorted and objects in
+  id order, and a change shows up per field; JSON lines is kept for the audit log, which only
+  ever grows.
+- **Secrets are masked, not captured.** Where an API does return a secret, the capture keeps just
+  enough to show that it changed: `…` plus the last 4 characters of a value longer than 12
+  characters, otherwise the last 2; never more than 2 of a password, and never more than half of
+  any value. A rotation therefore shows as a one-line diff, and the value itself is never
+  written.
 - **Tunnel configs keep cloudflared's key names.** cf-terraforming copies a tunnel's
   configuration verbatim, so the keys inside `config` are the API's camelCase names
   (`originRequest`, `originServerName`, `httpHostHeader`, `caPool`, `noTLSVerify`,
   `warp-routing`), not the provider's snake_case attributes. `terraform validate` ignores unknown
   keys inside a nested attribute, so the tree still validates and every ingress rule and origin
   parameter is recorded faithfully; the file just could not be applied as-is. No tunnel secret or
-  run token is ever captured: the listing carries none, the token endpoint needs a write
-  permission, and `cf-sync` strips any `tunnel_secret` a generate emits. Deleted tunnels, routes
+  run token is captured whole: the listing carries no secret, the token endpoint needs a write
+  permission, and `cf-sync` masks any `tunnel_secret` a generate emits. Deleted tunnels, routes
   and virtual networks, which the API keeps listing, are filtered out.
 - **Wiring, not code.** Account-level capture records *which* Workers / D1 / R2 / KV / Queue
   resources exist and how they are wired to zones; never Worker source or bindings (each app's
   own repo and wrangler are the source of truth), D1 schema or data, R2 objects, KV values, or
-  secret values (write-only at Cloudflare's API, by design).
+  secret values (write-only at most of Cloudflare's API; the few it returns are masked).
 - **Failures never clobber.** Each artifact is written only after a fully successful pull;
   transient API errors are retried, and a persistent failure keeps the previous file and makes
   the run exit non-zero.
@@ -218,16 +227,17 @@ This tool repository, by contrast, contains no account data at all.
 - Tunnel capture has been checked against a real account with no tunnels and a simulated account
   with several. Once your first tunnel exists, confirm it: `cf-sync account tunnels` reports
   `tunnels NEW (1)` and, when the tunnel has a published application, `tunnel-configs NEW (1)`;
-  `grep -in 'secret\|token' terraform/account-tunnel*.tf` finds nothing; and
+  `grep -in 'secret\|token' terraform/account-tunnel*.tf` finds nothing (a masked
+  `tunnel_secret` would mean cf-terraforming had started emitting one); and
   `terraform -chdir=terraform validate` still passes.
 - WARP Connector tunnels are not captured (a separate resource type); routes that point at them
   are.
 
 ## Tested with
 
-macOS; bash 5.2 (scripts also syntax-checked with macOS's stock bash 3.2); jq; Terraform 1.15.8;
-cf-terraforming 0.28.0; Cloudflare Terraform provider 5.22.0 (pinned by the lock file that
-`cf-sync init` writes).
+macOS; bash 5.2 (scripts also syntax-checked with macOS's stock bash 3.2); jq 1.7.1 (1.6 or
+later needed); Terraform 1.15.8; cf-terraforming 0.28.0; Cloudflare Terraform provider 5.22.0
+(pinned by the lock file that `cf-sync init` writes).
 
 ## License
 
