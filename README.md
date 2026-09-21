@@ -147,7 +147,7 @@ git commit -am "describe the change"
 | `terraform/waf-<zone>.tf` | WAF-family settings held outside the rulesets API: Bot Fight Mode / Super Bot Fight Mode, leaked-credential detection (+ its custom detection rules), IP Access Rules, Zone Lockdowns, User Agent Blocking (always present; the rule kinds appear only when the zone has some) |
 | `terraform/account-*.tf` | Account-level config: Workers custom domains & cron triggers, D1 databases, R2 buckets & custom domains, KV namespaces, Queues & consumers, Registrar settings, WAF lists + list items + account-level IP Access Rules (absent = account has none) |
 | `terraform/account-tunnel*.tf` | Cloudflare Tunnels: each tunnel's name and whether it is configured in the dashboard or locally (`account-tunnels.tf`); each dashboard-configured tunnel's published applications, its ingress rules with their origin parameters (`account-tunnel-configs.tf`); private-network routes and virtual networks (`account-tunnel-routes.tf`, `account-tunnel-vnets.tf`). Never tunnel secrets or run tokens (absent = account has none) |
-| `access-*.json` | Cloudflare Access (Zero Trust): the organisation and its settings (`access-org.json`), identity providers, groups, reusable policies, applications with their attached policies, service tokens (client id, secret version and expiry; never the secret) and custom block pages; secrets masked (absent = account has none) |
+| `access-*.json` | Cloudflare Access (Zero Trust): the organisation and its settings (`access-org.json`), identity providers, groups, reusable policies, applications with their attached policies, service tokens (client id, secret version, expiry and whether they are enabled; a token's secret exists only at creation) and custom block pages; secrets masked (absent = account has none) |
 
 An empty result produces no file, and removes a stale one: absence means "none of these".
 
@@ -217,7 +217,9 @@ This tool repository, by contrast, contains no account data at all.
   secret values (write-only at most of Cloudflare's API; the few it returns are masked).
 - **Failures never clobber.** Each artifact is written only after a fully successful pull;
   transient API errors are retried, and a persistent failure keeps the previous file and makes
-  the run exit non-zero.
+  the run exit non-zero. An empty generate counts as "the account has none of these" only when
+  cf-terraforming says the listing was empty: 0.28.0 exits successfully with no output when a
+  listing answers 404 or returns a null result, which would otherwise read as "deleted".
 - **Three commands, not one.** They are independent, proven scripts; each finds the capture repo
   the same way.
 
@@ -242,14 +244,15 @@ This tool repository, by contrast, contains no account data at all.
   `terraform -chdir=terraform validate` still passes.
 - WARP Connector tunnels are not captured (a separate resource type); routes that point at them
   are.
-- Access capture has been checked against a real account with a Zero Trust organisation and the
-  default One-time PIN login, and a simulated account with the rest. On first use, check two
-  assumptions: an application's reusable policies appear as `{id, name, precedence}` (if the API
-  stops flagging them reusable, they are copied in full instead); and once an OAuth identity
-  provider such as Auth0 exists, `access-idps.json` shows its `client_secret` as a masked tail
-  (`…Qk7f`) if the API returns it, so a rotation will show, or no `client_secret` at all if the
-  API withholds it. An account that has never set up Zero Trust is untested; its Access endpoints
-  may answer with errors, which report FAILED.
+- Access capture has been checked against a real account with an OIDC login, a rule group, three
+  reusable policies, an application and a service token; custom pages, SaaS applications, SCIM
+  and application-scoped policies only against a simulated one. Two things real data settled:
+  an application does store its reusable policies by reference, as `{id, name, precedence}` (a
+  policy the API does not flag reusable is copied in full instead); and Cloudflare never returns
+  an OIDC provider's `client_secret`, so there is nothing to mask and rotating it does not show
+  in the capture — the provider's `version` may be the only field that moves, which is
+  unverified. An account that has never set up Zero Trust is untested; its Access endpoints may
+  answer with errors, which report FAILED.
 - Not captured from Access: key rotation, tags, mTLS certificates, short-lived SSH certificates,
   infrastructure targets, bookmarks, users and seats, and legacy zone-level Access; nor Gateway
   and device settings, which are separate products.

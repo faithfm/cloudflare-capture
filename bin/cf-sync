@@ -113,8 +113,10 @@
 # names every custom page after the account id, and it cannot hold a service
 # token's client_id or expiry. An application lists its reusable policies by
 # reference (id, name, precedence); their rules are in access-policies.json.
-# Service tokens keep id, name, client_id, client_secret_version, duration and
-# expires_at: never the secret, which the API shows only at creation.
+# A service token carries no secret to capture: the API returns one only at
+# creation, and client_secret_version records a rotation. Nor does an OIDC
+# identity provider's config carry its client_secret — Cloudflare withholds it
+# — so nothing there is maskable either.
 # Account-level Bulk Redirects are NOT captured — verify none exist in this account.
 set -euo pipefail
 
@@ -339,6 +341,13 @@ mask_secrets() {
 # or "<prefix>@<attr>" (rekey: for account types without payload ids).
 # Retries transient failures with backoff. 0 = success, 1 = persistent failure
 # (last error line echoed to stderr).
+# An empty result counts as success only when cf-terraforming confirms the
+# listing was empty ("no resources of type ... found to generate", which it
+# prints after a successful listing of nothing). 0.28.0 otherwise exits 0 with
+# no output when a listing answers 404, or a 200 whose result is null — it logs
+# an INFO "error getting API response" and carries on — and commit_out would
+# read that as "none" and remove the captured file. One zone setting answering
+# 404 would empty a whole zone's settings that way.
 run_gen() {
   local tmp="$1" spec="$2" rt="$3" attempt err prefix attr=""
   shift 3
@@ -350,7 +359,8 @@ run_gen() {
          --terraform-install-path terraform --terraform-binary-path "$TFBIN" \
          "$@" 2>"$err" \
        | mask_secrets \
-       | { if [ -n "$attr" ]; then rekey "$attr" "$prefix"; else stabilize "$prefix"; fi; } > "$tmp"; then
+       | { if [ -n "$attr" ]; then rekey "$attr" "$prefix"; else stabilize "$prefix"; fi; } > "$tmp" \
+       && { [ -s "$tmp" ] || grep -q 'no resources of type' "$err"; }; then
       rm -f "$err"
       return 0
     fi
@@ -757,10 +767,14 @@ sync_workers_txt() { # 0 = workers.txt refreshed; 1 = FAILED (previous file kept
 }
 
 # Cloudflare Access (Zero Trust), all JSON (see the header's Access note). The
-# organisation is a singleton; everything else is a listing in id order.
-# Timestamps are dropped, and so is a policy's app_count, which follows from
-# the applications that list it. An attached policy the API flags reusable is
-# reduced to a reference; any other is kept whole.
+# organisation is a singleton; everything else is a listing in id order. Every
+# type keeps what the API returns, less timestamps, usage telemetry (a service
+# token's last_seen_at) and derived counts (app_count, which follows from the
+# applications that list a policy or a page). Naming the fields to keep instead
+# would silently drop whatever Cloudflare adds next, as it did with a service
+# token's enabled flag; secrets are kept out by masking, not by a field list.
+# An attached policy the API flags reusable is reduced to a reference; any
+# other is kept whole.
 sync_access() {
   local a="/accounts/$ACCOUNT_ID/access"
   capture_json access-org.json      "$a/organizations"      'single | del(.created_at, .updated_at)'
@@ -775,9 +789,7 @@ sync_access() {
                     else . end)
     | sort_by(.id)'
   capture_json access-service-tokens.json "$a/service_tokens" '
-    listing | map({id, name, client_id, client_secret_version, duration, expires_at}
-                  | with_entries(select(.value != null)))
-    | sort_by(.id)'
+    listing | map(del(.created_at, .updated_at, .last_seen_at)) | sort_by(.id)'
   sync_access_pages
 }
 
@@ -800,7 +812,8 @@ sync_access_pages() {
       return 0
     fi
   done <<<"$uids"
-  json_out "$out" "(unexpected custom page)" 'map({uid, name, type, custom_html}) | sort_by(.uid)' \
+  json_out "$out" "(unexpected custom page)" \
+    'map(del(.created_at, .updated_at, .app_count)) | sort_by(.uid)' \
     < <(jq -s . "$pages")
   rm -f "$pages"
 }
