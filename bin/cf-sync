@@ -10,7 +10,7 @@
 #   cf-sync zones               refresh the zone indexes only
 #   cf-sync init [account-id]   scaffold a new capture repo in the current directory
 # type (zone):    dns | rulesets | pagerules | settings | waf   (omitted = all types)
-# type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access
+# type (account): workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access | members
 # With no argument and no terminal (cron/automation), behaves like "all".
 # Outside a capture repo, a terminal run offers the capture repos used recently
 # (kept in ${XDG_STATE_HOME:-~/.local/state}/cloudflare-capture/recent-repos)
@@ -43,6 +43,9 @@
 #   access-*.json                  Cloudflare Access (Zero Trust): organisation,
 #                                  identity providers, groups, policies,
 #                                  applications, service tokens, custom pages (JSON)
+#   account.json                   account settings, incl. two-factor enforcement (JSON)
+#   members.json                   account membership: members, their roles and
+#                                  their scoped policies (JSON)
 #   .cf-capture-version            cloudflare-capture version that made the last run
 #   terraform/dns-<zone>.tf        DNS records
 #   terraform/settings-<zone>.tf   zone settings (incl. SSL/TLS)
@@ -818,7 +821,42 @@ sync_access_pages() {
   rm -f "$pages"
 }
 
-sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access
+# Account membership — who can get into this account and with what rights,
+# plus the account-wide settings that govern membership (two-factor
+# enforcement, OAuth app access). This is the state behind the dashboard's
+# Manage Account -> Members page: the audit log records membership *events*
+# (add_member, accept_member, set_member_roles), this records what the
+# membership now IS.
+# Each member's roles[] and policies[].permission_groups[] arrive with
+# Cloudflare's whole permission matrix inlined per role (access, api_gateway,
+# casb, ces_*, d1, dex, ...). That matrix is Cloudflare's definition of the
+# role, not our config, and it gains keys whenever Cloudflare ships a product
+# -- so every member's entry would churn on a change nobody here made. Both
+# are reduced to {id, name}. What IS ours is which roles a member holds and
+# what each scoped policy covers: permission groups x resource groups, where a
+# resource group's scope.key names the whole account or one zone (by zone id --
+# zones.txt maps those to names). Cloudflare's 184-entry /roles catalogue is
+# Cloudflare's config too, like its managed rulesets, and is not captured.
+# user.first_name / last_name are dropped: self-service profile fields with no
+# config value. Member emails ARE kept -- attribution is the point, as in the
+# audit log. No API tokens: account-owned tokens need API Tokens:Read (absent
+# from the Read All Resources template) and user-owned tokens are invisible to
+# another user's token at all, so third-party scoped tokens cannot be captured
+# here -- they are documented in the capture repo instead.
+sync_members() {
+  capture_json account.json "/accounts/$ACCOUNT_ID" 'single | del(.created_on, .legacy_flags)'
+  capture_json members.json "/accounts/$ACCOUNT_ID/members?per_page=1000" '
+    listing | map(del(.user.first_name, .user.last_name)
+                  | .roles |= ((. // []) | map({id, name}) | sort_by(.id))
+                  | if (.policies | type) == "array"
+                    then .policies |= (map(.permission_groups |= ((. // []) | map({id, name}) | sort_by(.id))
+                                           | .resource_groups |= ((. // []) | map(del(.meta)) | sort_by(.id)))
+                                       | sort_by(.id))
+                    else . end)
+    | sort_by(.email, .id)'
+}
+
+sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access | members
   local tsel="${1:-}" rc
   ZIDX=1 ZTOTAL=1 ZNAME="(account)"
   echo
@@ -891,10 +929,13 @@ sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv |
   if [ -z "$tsel" ] || [ "$tsel" = access ]; then
     sync_access
   fi
+  if [ -z "$tsel" ] || [ "$tsel" = members ]; then
+    sync_members
+  fi
 }
 
 is_zone_type()    { case "$1" in dns|rulesets|pagerules|settings|waf) ;; *) return 1 ;; esac; }
-is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar|waf|notifications|tunnels|access) ;; *) return 1 ;; esac; }
+is_account_type() { case "$1" in workers|d1|r2|kv|queues|registrar|waf|notifications|tunnels|access|members) ;; *) return 1 ;; esac; }
 
 check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account | any
   local t="${1:-}" scope="${2:-any}"
@@ -903,9 +944,9 @@ check_type() { # $1 = type filter ("" = all), $2 = valid scope: zone | account |
     zone)    is_zone_type "$t" && return 0
              echo "unknown type: $t (dns | rulesets | pagerules | settings | waf)" >&2 ;;
     account) is_account_type "$t" && return 0
-             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access)" >&2 ;;
+             echo "unknown type: $t (workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access | members)" >&2 ;;
     *)       is_zone_type "$t" || is_account_type "$t" && return 0
-             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings | waf; account: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access)" >&2 ;;
+             echo "unknown type: $t (zone: dns | rulesets | pagerules | settings | waf; account: workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access | members)" >&2 ;;
   esac
   exit 1
 }
@@ -1064,6 +1105,7 @@ type_menu() { # sets TYPE_SEL ("" = all types); Enter defaults to 0; number or n
   echo " 12 - notifications"
   echo " 13 - tunnels"
   echo " 14 - access"
+  echo " 15 - members        (account members + their roles / scoped policies)"
   echo
   echo "  0 - ALL TYPES"
   echo
@@ -1085,7 +1127,8 @@ type_menu() { # sets TYPE_SEL ("" = all types); Enter defaults to 0; number or n
       12|notifications) TYPE_SEL="notifications" ;;
       13|tunnels)       TYPE_SEL="tunnels" ;;
       14|access)        TYPE_SEL="access" ;;
-      *) echo "invalid selection: $choice — enter 0-14 or a type name" >&2; continue ;;
+      15|members)       TYPE_SEL="members" ;;
+      *) echo "invalid selection: $choice — enter 0-15 or a type name" >&2; continue ;;
     esac
     break
   done
@@ -1100,7 +1143,7 @@ menu() {
   max=$((i - 1))
   echo
   echo "  0 - ALL ZONES (+ account-level)"
-  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar / waf / notifications / tunnels / access)"
+  echo "  a - ACCOUNT-LEVEL only (workers / d1 / r2 / kv / queues / registrar / waf / notifications / tunnels / access / members)"
   echo
   while :; do
     read -rp "Sync what (number, zone name, or 'a')? [0]: " choice

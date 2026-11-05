@@ -91,7 +91,7 @@ cf-sync zones                    refresh the zone indexes only
 cf-sync init [account-id]        scaffold a new capture repo in the current directory
 
 type (zone)    = dns | rulesets | pagerules | settings | waf
-type (account) = workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access
+type (account) = workers | d1 | r2 | kv | queues | registrar | waf | notifications | tunnels | access | members
 ```
 
 ```text
@@ -140,6 +140,8 @@ git commit -am "describe the change"
 | `workers.txt` | Worker inventory: script name + created date |
 | `registrar.txt` | Cloudflare-registered domains: name + registered + expires |
 | `notifications.json` | Notification policies (destinations by id; webhook URLs never captured) |
+| `account.json` | Account settings: name, type, and the account-wide membership controls (two-factor enforcement, OAuth app access, API access, abuse contact) |
+| `members.json` | Account membership: each member's email, invite status, two-factor flag, roles (by id + name) and scoped policies — permission groups x resource groups, where a resource group covers the whole account or named zones (by zone id; `zones.txt` maps those to names) |
 | `terraform/dns-<zone>.tf` | DNS records, including the proxied (orange-cloud) flag |
 | `terraform/settings-<zone>.tf` | Zone settings, including SSL/TLS |
 | `terraform/rulesets-<zone>.tf` | Redirect / transform / WAF rules (absent = zone has none) |
@@ -156,7 +158,8 @@ An empty result produces no file, and removes a stale one: absence means "none o
 A capture repo is a detailed map of your infrastructure, and it contains personal data.
 `audit-log.jsonl` records the email address of everyone who has changed the account, third
 parties included, `notifications.json` holds alert recipients' addresses, and
-`access-groups.json` lists everyone Cloudflare Access lets in. The DNS files expose origin IP
+`access-groups.json` lists everyone Cloudflare Access lets in, `members.json` names every
+account member and whether they have two-factor authentication on. The DNS files expose origin IP
 addresses, which a site behind a WAF most wants hidden, tunnel configurations name the internal
 service behind each published hostname, and Access policies name the IP ranges that skip the
 login. Push capture repos only to private remotes. (`cf-sync init` puts this warning into every
@@ -205,6 +208,16 @@ This tool repository, by contrast, contains no account data at all.
   run token is captured whole: the listing carries no secret, the token endpoint needs a write
   permission, and `cf-sync` masks any `tunnel_secret` a generate emits. Deleted tunnels, routes
   and virtual networks, which the API keeps listing, are filtered out.
+- **Members are roles and scopes, not permission matrices.** A member's roles and permission
+  groups arrive from the API with Cloudflare's entire permission matrix inlined per role
+  (`access`, `api_gateway`, `casb`, `ces_*`, `d1`, `dex`, ...). That matrix is Cloudflare's
+  definition of the role, not your config, and it gains keys whenever Cloudflare ships a
+  product — so capturing it whole would churn every member's entry on a change nobody in your
+  account made. Each role and permission group is reduced to `{id, name}`; what is yours is
+  which roles a member holds and what each scoped policy covers. Cloudflare's 184-entry role
+  catalogue is Cloudflare's config, like its managed rulesets, and is not captured. API tokens
+  are out of reach: account-owned tokens need `API Tokens: Read` (absent from the Read All
+  Resources template) and user-owned tokens are invisible to another user's token at all.
 - **Access is JSON.** cf-terraforming's HCL for Cloudflare Access fails `terraform validate` for
   identity providers and applications (among other things, it writes each attached policy with
   both its id and its rules), names every custom page alike, and cannot hold a service token's
