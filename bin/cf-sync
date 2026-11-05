@@ -1188,7 +1188,7 @@ menu() {
 # to overwrite anything: every target is checked before the first write.
 init_repo() {
   local id="${1:-}" root f tpl="$TOOL_DIR/templates" existing=()
-  local files=(cf-sync.conf .gitignore README.md terraform/provider.tf terraform/.terraform.lock.hcl)
+  local files=(cf-sync.conf .gitignore README.md CLAUDE.md terraform/provider.tf terraform/.terraform.lock.hcl)
   if root=$(find_capture_root); then
     echo "Already inside a capture repo at $root." >&2
     exit 1
@@ -1213,6 +1213,7 @@ init_repo() {
   mkdir -p terraform
   sed "s/__ACCOUNT_ID__/$id/" "$tpl/cf-sync.conf" > cf-sync.conf
   sed "s/__ACCOUNT_ID__/$id/" "$tpl/README.md"    > README.md
+  cp "$tpl/CLAUDE.md"          CLAUDE.md
   cp "$tpl/gitignore"          .gitignore
   cp "$tpl/provider.tf"        terraform/provider.tf
   cp "$tpl/terraform.lock.hcl" terraform/.terraform.lock.hcl

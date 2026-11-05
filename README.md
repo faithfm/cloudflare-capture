@@ -54,8 +54,9 @@ cf-sync init
 ```
 
 `init` asks for the account id (dashboard → account home → copy **Account ID**; or pass it as
-`cf-sync init <account-id>`), writes five files (`cf-sync.conf`, `.gitignore`, a `README.md`,
-and `terraform/provider.tf` with its lock file) and commits them. It refuses to run inside an
+`cf-sync init <account-id>`), writes six files (`cf-sync.conf`, `.gitignore`, a `README.md`,
+a `CLAUDE.md` of working conventions, and `terraform/provider.tf` with its lock file) and
+commits them. It refuses to run inside an
 existing capture repo and never overwrites a file.
 
 ## First run: the API token
@@ -233,6 +234,12 @@ This tool repository, by contrast, contains no account data at all.
   the run exit non-zero. An empty generate counts as "the account has none of these" only when
   cf-terraforming says the listing was empty: 0.28.0 exits successfully with no output when a
   listing answers 404 or returns a null result, which would otherwise read as "deleted".
+- **Attribution is a convention, so it ships with the scaffold.** A capture diff says what
+  changed; only `audit-log.jsonl` says who changed it and when, and it expires. The `CLAUDE.md`
+  that `cf-sync init` writes holds the procedure — top the archive up before committing, find
+  the actor, write the commit message around them, and say so plainly when a diff has no audit
+  event behind it (Cloudflare changed an API shape; nobody did anything). It is read by agents
+  working in the repo and by whoever inherits it.
 - **Three commands, not one.** They are independent, proven scripts; each finds the capture repo
   the same way.
 
