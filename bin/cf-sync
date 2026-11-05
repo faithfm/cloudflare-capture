@@ -78,7 +78,9 @@
 # account (out of scope: capture covers the account's own config).
 # Worker routes and R2 CORS/lifecycle rules are unsupported by
 # cf-terraforming v0.28 — add jq-to-HCL fallbacks if ever used. R2 artifacts
-# report "skipped" until R2 is enabled on the account (dashboard toggle).
+# report "skipped" until R2 is enabled on the account (dashboard toggle), and
+# the Access artifacts the same on an account that has never enabled Zero
+# Trust (access_status) -- in neither case has anything failed.
 # Notification policies are JSON, not HCL: the provider's alert_type enum lags
 # Cloudflare (5.24.0 still rejects the auto-created billing_budget_alert) and
 # one unknown value would fail `terraform validate` for the whole tree.
@@ -565,6 +567,23 @@ ensure_tf_init() {
 # toggle, has a billing dimension). Probe and distinguish outcomes so a network
 # blip or missing token scope reports FAILED, never a definitive "skipped":
 # 0 = enabled, 1 = R2 not enabled (Cloudflare error 10042), 2 = probe failed.
+# 0 = Access (Zero Trust) is enabled, 1 = never enabled on this account,
+# 2 = could not tell. An account that has never clicked "Enable Access"
+# answers 403 with access.api.error.not_enabled on every Access endpoint, which
+# is "the account has none of these", not a failure -- without this probe a
+# plain personal account reports seven FAILED artifacts and a non-zero exit on
+# every single run. The error code is Cloudflare's generic 9999, so the message
+# is what identifies it.
+access_status() {
+  local resp
+  resp=$(curl -s --retry 3 --max-time 15 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+    "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/access/organizations") || return 2
+  jq -e '.success == true' <<<"$resp" >/dev/null 2>&1 && return 0
+  jq -e '.errors[]? | select(.message // "" | contains("access.api.error.not_enabled"))' \
+    <<<"$resp" >/dev/null 2>&1 && return 1
+  return 2
+}
+
 r2_status() {
   local resp
   resp=$(curl -s --retry 3 --max-time 15 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -779,7 +798,17 @@ sync_workers_txt() { # 0 = workers.txt refreshed; 1 = FAILED (previous file kept
 # An attached policy the API flags reusable is reduced to a reference; any
 # other is kept whole.
 sync_access() {
-  local a="/accounts/$ACCOUNT_ID/access"
+  local a="/accounts/$ACCOUNT_ID/access" rc=0 f
+  access_status || rc=$?
+  if [ "$rc" = 1 ]; then
+    for f in access-org access-idps access-groups access-policies access-apps \
+             access-service-tokens access-custom-pages; do
+      progress "$f.json" "skipped (Access not enabled on account)"
+    done
+    return 0
+  fi
+  # rc 2 (probe inconclusive) deliberately falls through to the captures below:
+  # each one then reports its own failure, which says more than the probe can.
   capture_json access-org.json      "$a/organizations"      'single | del(.created_at, .updated_at)'
   capture_json access-idps.json     "$a/identity_providers" 'listing | map(del(.created_at, .updated_at)) | sort_by(.id)'
   capture_json access-groups.json   "$a/groups"             'listing | map(del(.created_at, .updated_at)) | sort_by(.id)'

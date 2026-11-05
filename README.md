@@ -251,7 +251,9 @@ This tool repository, by contrast, contains no account data at all.
 - Managed Transforms (Rules → Settings) are not captured yet.
 - Worker routes and R2 CORS/lifecycle rules are unsupported by cf-terraforming 0.28 and not
   captured. R2 artifacts report "skipped" until R2 is enabled on the account (a dashboard toggle
-  with a billing dimension).
+  with a billing dimension), and the Access artifacts do the same on an account that has never
+  enabled Zero Trust — every Access endpoint answers 403 `access.api.error.not_enabled` there,
+  which means "the account has none of these", not a failure.
 - Registrar capture covers Cloudflare Registrar only: managed settings (auto-renew / lock / WHOIS
   privacy) as HCL, plus `registrar.txt` dates. WHOIS contact data is never captured, and domains
   registered at another registrar are out of scope.
