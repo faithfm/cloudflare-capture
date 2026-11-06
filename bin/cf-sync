@@ -38,6 +38,8 @@
 #   zones-meta.tsv                 per-zone metadata: name, plan, status, type,
 #                                  paused, assigned nameservers (tab-separated)
 #   workers.txt                    Worker inventory: <script-name> <created-date>
+#   workers.json                   Worker configuration: settings, bindings (values
+#                                  masked), workers.dev, Builds triggers, routes (JSON)
 #   registrar.txt                  Cloudflare-registered domains: <name> <registered> <expires>
 #   notifications.json             notification policies (JSON, see below)
 #   access-*.json                  Cloudflare Access (Zero Trust): organisation,
@@ -70,14 +72,16 @@
 #                                  virtual networks
 # An empty result (e.g. zone has no page rules) produces no file, and removes a
 # stale one — absence of the file means "zone has none of these".
-# Deliberately NOT captured — wiring, not code/data: Worker script code + bindings
-# (each app's own repo + wrangler are the source of truth), D1 schema/data, R2
+# Deliberately NOT captured — wiring, not code/data: Worker script code,
+# deployments and versions (each app's own repo + wrangler are the source of
+# truth; bindings ARE captured, by name/type/target, see sync_workers_json), D1 schema/data, R2
 # object contents, KV values, queue messages, secret values in full (most are
 # write-only at the API; one that is returned is masked, see Secrets below),
 # WHOIS contact PII, and registration state for domains registered outside this
 # account (out of scope: capture covers the account's own config).
-# Worker routes and R2 CORS/lifecycle rules are unsupported by
-# cf-terraforming v0.28 — add jq-to-HCL fallbacks if ever used. R2 artifacts
+# R2 CORS/lifecycle rules are unsupported by cf-terraforming v0.28 — add
+# jq-to-HCL fallbacks if ever used (Worker routes, also unsupported, are read
+# from the API into workers.json). R2 artifacts
 # report "skipped" until R2 is enabled on the account (dashboard toggle), and
 # the Access artifacts the same on an account that has never enabled Zero
 # Trust (access_status) -- in neither case has anything failed.
@@ -788,6 +792,95 @@ sync_workers_txt() { # 0 = workers.txt refreshed; 1 = FAILED (previous file kept
   fi
 }
 
+# Worker configuration -> workers.json: what the dashboard's Worker pages show
+# that is not code. Three parts:
+#   account  the account's workers.dev subdomain and Workers defaults
+#   scripts  per script, the listing entry merged with its settings (compat
+#            date + flags, usage model, placement, limits, logpush,
+#            observability, tail consumers, tags, bindings), whether it is
+#            served on workers.dev and on preview URLs, and its Workers Builds
+#            triggers (the Git repo, branch and build/deploy commands that
+#            deploy it, if it is connected to one)
+#   routes   every zone's Worker routes (zone + pattern -> script); a route
+#            with no script turns Workers off for that pattern
+# Bindings are wiring and are kept by name, type and target (namespace,
+# bucket, database, service ...). Values are not: a plain_text or json
+# binding's value is masked like a secret (people put tokens in plain vars),
+# so a change still shows; secret_text values never come back from the API.
+# Dropped as churn: timestamps, etags, deployment ids and the per-deploy
+# annotations (workers/triggered_by etc.); deployments and versions are
+# deploy history, not config. Builds environment variables are not fetched
+# (their own endpoint, and may hold secrets). All-or-nothing: any failed
+# fetch keeps the previous file.
+sync_workers_json() {
+  local out=workers.json a="/accounts/$ACCOUNT_ID/workers" resp parts names name zid zname
+  wq() { jq -c --arg mask "$MASK" "$JQ_PRELUDE $1"; }
+  parts=$(mktemp -d)
+  # account part
+  # An account that has never opened Workers & Pages has no workers.dev
+  # subdomain: 404 with error 10007, which is "none", not a failure.
+  if ! resp=$(curl -s --retry 3 --max-time 15 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "https://api.cloudflare.com/client/v4$a/subdomain") \
+     || ! jq -c 'if .success == true and (.result | type) == "object" then {subdomain: .result.subdomain}
+                 elif any(.errors[]?; .code == 10007) then {subdomain: null}
+                 else error("unexpected workers.dev subdomain response") end' <<<"$resp" > "$parts/sub" \
+     || ! resp=$(api "$a/account-settings") || ! wq 'single' <<<"$resp" > "$parts/acct"; then
+    gen_failed "$out" "to fetch Workers account settings"; rm -rf "$parts"; return 0
+  fi
+  # scripts part
+  if ! resp=$(api "$a/scripts") || ! wq 'listing[]' <<<"$resp" > "$parts/list" \
+     || ! names=$(jq -r '.id // error("script without id")' "$parts/list"); then
+    gen_failed "$out" "to list Worker scripts"; rm -rf "$parts"; return 0
+  fi
+  : > "$parts/scripts"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if ! resp=$(api "$a/scripts/$name/settings" </dev/null)        || ! wq 'single' <<<"$resp" > "$parts/s" \
+       || ! resp=$(api "$a/scripts/$name/script-settings" </dev/null) || ! wq 'single' <<<"$resp" > "$parts/ss" \
+       || ! resp=$(api "$a/scripts/$name/subdomain" </dev/null)       || ! wq 'single' <<<"$resp" > "$parts/wd" \
+       || ! resp=$(api "/accounts/$ACCOUNT_ID/builds/workers/$name/triggers" </dev/null) \
+       || ! wq 'listing' <<<"$resp" > "$parts/b"; then
+      gen_failed "$out" "to fetch settings of Worker $name"; rm -rf "$parts"; return 0
+    fi
+    jq -c --arg n "$name" --slurpfile s "$parts/s" --slurpfile ss "$parts/ss" \
+          --slurpfile wd "$parts/wd" --slurpfile b "$parts/b" '
+      select(.id == $n)
+      | del(.created_on, .modified_on, .etag, .deployment_id, .last_deployed_from, .routes)
+      + ($s[0] | del(.annotations))
+      + (if $s[0] | has("observability") then {} else {observability: $ss[0].observability} end)
+      + {workers_dev: $wd[0], builds: ($b[0] | map(del(.created_on, .modified_on, .deleted_on)))}' \
+      "$parts/list" >> "$parts/scripts"
+  done <<<"$names"
+  # routes part: one listing per zone in zones.txt
+  : > "$parts/routes"
+  while read -r zid zname; do
+    [ -n "$zid" ] || continue
+    if ! resp=$(api "/zones/$zid/workers/routes" </dev/null) \
+       || ! jq -c --arg mask "$MASK" --arg z "$zname" "$JQ_PRELUDE listing[] | {zone: \$z} + ." \
+              <<<"$resp" >> "$parts/routes"; then
+      gen_failed "$out" "to list Worker routes of $zname"; rm -rf "$parts"; return 0
+    fi
+  done < zones.txt
+  # No scripts and no routes: the account has no Workers, so no file (the
+  # account defaults alone are Cloudflare's, not config anyone made).
+  json_out "$out" "(unexpected Worker settings)" '
+    if (.scripts | length) == 0 and (.routes | length) == 0 then [] else
+    def maskval: if . == null then . else (if type == "string" then . else tojson end) | tail(if length > 12 then 4 else 2 end) end;
+    {account:  (.sub + .acct),
+     scripts:  (.scripts | map(.bindings |= ((. // []) | map(
+                  if .type == "plain_text" then .text |= maskval
+                  elif .type == "json" then .json |= maskval
+                  else . end
+                  | if has("key_base64") then .key_base64 |= maskval else . end
+                  | if has("jwk") then .jwk |= maskval else . end) | sort_by(.name)))
+               | sort_by(.id)),
+     routes:   (.routes | sort_by(.zone, .pattern, .id))} end' \
+    < <(jq -n --slurpfile sub "$parts/sub" --slurpfile acct "$parts/acct" \
+              --slurpfile scripts "$parts/scripts" --slurpfile routes "$parts/routes" \
+              '{sub: $sub[0], acct: $acct[0], scripts: $scripts, routes: $routes}')
+  rm -rf "$parts"
+}
+
 # Cloudflare Access (Zero Trust), all JSON (see the header's Access note). The
 # organisation is a singleton; everything else is a listing in id order. Every
 # type keeps what the API returns, less timestamps, usage telemetry (a service
@@ -900,6 +993,7 @@ sync_account() { # $1 (optional) = single account type: workers | d1 | r2 | kv |
       gen_failed "terraform/account-workers-crons.tf" "(worker inventory unavailable)"
     fi
     gen_to    "terraform/account-workers-domains.tf" "wdom_"  cloudflare_workers_custom_domain --account "$ACCOUNT_ID"
+    sync_workers_json
   fi
   if [ -z "$tsel" ] || [ "$tsel" = d1 ]; then
     gen_to    "terraform/account-d1.tf"              "d1_@name" cloudflare_d1_database         --account "$ACCOUNT_ID"

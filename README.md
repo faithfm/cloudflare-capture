@@ -139,6 +139,7 @@ git commit -am "describe the change"
 | `zones.txt` | Zone index: zone-id + zone-name |
 | `zones-meta.tsv` | Per-zone metadata: plan, status, type, paused, assigned nameservers |
 | `workers.txt` | Worker inventory: script name + created date |
+| `workers.json` | Worker configuration: the account's workers.dev subdomain and defaults; per script its settings (compatibility date and flags, usage model, placement, limits, logpush, observability, tail consumers), bindings by name, type and target (`plain_text` / `json` values masked), whether it serves on workers.dev and preview URLs, and its Workers Builds (Git) triggers; every zone's Worker routes. Never code, deployments or secret values (absent = account has no Workers) |
 | `registrar.txt` | Cloudflare-registered domains: name + registered + expires |
 | `notifications.json` | Notification policies (destinations by id; webhook URLs never captured) |
 | `account.json` | Account settings: name, type, and the account-wide membership controls (two-factor enforcement, OAuth app access, API access, abuse contact) |
@@ -226,9 +227,11 @@ This tool repository, by contrast, contains no account data at all.
   application lists its reusable policies by reference (id, name, precedence); their rules are in
   `access-policies.json`, so a policy change shows up once.
 - **Wiring, not code.** Account-level capture records *which* Workers / D1 / R2 / KV / Queue
-  resources exist and how they are wired to zones; never Worker source or bindings (each app's
-  own repo and wrangler are the source of truth), D1 schema or data, R2 objects, KV values, or
-  secret values (write-only at most of Cloudflare's API; the few it returns are masked).
+  resources exist and how they are wired together and to zones: a Worker's settings, routes and
+  bindings (by name, type and target), but never its source, deployments or versions (each app's
+  own repo and wrangler are the source of truth for those), D1 schema or data, R2 objects, KV
+  values, or secret values (write-only at most of Cloudflare's API; the few it returns are
+  masked, and so is a plain-text or JSON binding's value, since tokens end up in plain vars).
 - **Failures never clobber.** Each artifact is written only after a fully successful pull;
   transient API errors are retried, and a persistent failure keeps the previous file and makes
   the run exit non-zero. An empty generate counts as "the account has none of these" only when
@@ -249,8 +252,8 @@ This tool repository, by contrast, contains no account data at all.
   set (Keychain storage is macOS-only), but `cf-audit-archive` and `cf-events` currently use BSD
   `date` options and fail with GNU `date`.
 - Managed Transforms (Rules → Settings) are not captured yet.
-- Worker routes and R2 CORS/lifecycle rules are unsupported by cf-terraforming 0.28 and not
-  captured. R2 artifacts report "skipped" until R2 is enabled on the account (a dashboard toggle
+- R2 CORS/lifecycle rules are unsupported by cf-terraforming 0.28 and not captured (Worker
+  routes, likewise unsupported, are read straight from the API into `workers.json`). R2 artifacts report "skipped" until R2 is enabled on the account (a dashboard toggle
   with a billing dimension), and the Access artifacts do the same on an account that has never
   enabled Zero Trust — every Access endpoint answers 403 `access.api.error.not_enabled` there,
   which means "the account has none of these", not a failure.
